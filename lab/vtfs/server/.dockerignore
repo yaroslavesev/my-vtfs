@@ -1,0 +1,5 @@
+.env
+.env.test
+.git
+.DS_Store
+*.log
