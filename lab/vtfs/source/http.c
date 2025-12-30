@@ -13,10 +13,6 @@
 
 #include "http.h"
 
-/*
- * Make server configurable without recompiling:
- *   sudo insmod vtfs.ko server_ip=192.168.56.1 server_port=8089
- */
 static char *server_ip = "192.168.56.1";
 static int server_port = 8089;
 
@@ -27,7 +23,6 @@ MODULE_PARM_DESC(server_port, "VTFS server port");
 
 #define REQ_BUF_MAX 4096
 
-// builds HTTP request into vec
 static int fill_request(struct kvec *vec, const char *token, const char *method,
                         size_t arg_size, va_list args)
 {
@@ -35,7 +30,11 @@ static int fill_request(struct kvec *vec, const char *token, const char *method,
     size_t off = 0;
     int n;
 
-    if (!buf) return -ENOMEM;
+    if (!buf)
+        return -ENOMEM;
+
+    if (!token) token = "";
+    if (!method) method = "";
 
     n = scnprintf(buf + off, REQ_BUF_MAX - off, "GET /api/%s?token=%s", method, token);
     off += n;
@@ -51,12 +50,12 @@ static int fill_request(struct kvec *vec, const char *token, const char *method,
 
         if (off >= REQ_BUF_MAX - 128) {
             kfree(buf);
-            return -ENOSPC; // request too large
+            return -ENOSPC;
         }
     }
 
     n = scnprintf(buf + off, REQ_BUF_MAX - off,
-                  " HTTP/1.1\r\nHost:%s\r\nConnection: close\r\n\r\n", server_ip);
+                  " HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", server_ip);
     off += n;
 
     vec->iov_base = buf;
@@ -64,21 +63,22 @@ static int fill_request(struct kvec *vec, const char *token, const char *method,
     return 0;
 }
 
-// read whole response
 static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
 {
     struct msghdr msg;
     struct kvec vec;
     int total = 0;
 
-    while (total < buffer_size) {
+    while (total < (int)buffer_size) {
         memset(&msg, 0, sizeof(msg));
         vec.iov_base = buffer + total;
         vec.iov_len = buffer_size - total;
 
         int ret = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
-        if (ret == 0) break; // EOF
-        if (ret < 0) return ret;
+        if (ret == 0)
+            break;
+        if (ret < 0)
+            return ret;
 
         total += ret;
     }
@@ -86,58 +86,96 @@ static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
     return total;
 }
 
-// parse HTTP response. returns int64 ret_val from body; copies payload to resp (NOT null-terminated)
+static int parse_status_code(const char *raw)
+{
+    const char *p = strchr(raw, ' ');
+    if (!p) return -EINVAL;
+    p++;
+    if (!p[0] || !p[1] || !p[2]) return -EINVAL;
+    if (p[0] < '0' || p[0] > '9') return -EINVAL;
+    if (p[1] < '0' || p[1] > '9') return -EINVAL;
+    if (p[2] < '0' || p[2] > '9') return -EINVAL;
+    return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
+static int find_content_length(const char *headers, int *out_len)
+{
+    const char *p = headers;
+    const char *needle = "Content-Length:";
+    size_t needle_len = strlen(needle);
+
+    while (p && *p) {
+        const char *line_end = strstr(p, "\r\n");
+        int crlf = 1;
+        if (!line_end) {
+            line_end = strstr(p, "\n");
+            crlf = 0;
+        }
+        if (!line_end) break;
+
+        size_t line_len = (size_t)(line_end - p);
+
+        if (line_len >= needle_len && !strncmp(p, needle, needle_len)) {
+            const char *v = p + needle_len;
+            while (*v == ' ' || *v == '\t') v++;
+            if (kstrtoint(v, 10, out_len))
+                return -EINVAL;
+            return 0;
+        }
+
+        p = line_end + (crlf ? 2 : 1);
+        if (*p == '\r' || *p == '\n')
+            break;
+    }
+
+    return -ENOENT;
+}
+
 static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_t resp_size)
 {
-    char *p = raw;
-    char *line;
-    char *status_str;
-    int content_length = -1;
+    char *header_end = strstr(raw, "\r\n\r\n");
+    size_t header_sep = 4;
+    if (!header_end) {
+        header_end = strstr(raw, "\n\n");
+        header_sep = 2;
+    }
+    if (!header_end)
+        return -6;
 
-    // Status line
-    line = strsep(&p, "\r\n");
-    if (!line) return -6;
-
-    // "HTTP/1.1 200 OK"
-    (void)strsep(&line, " ");          // HTTP/1.1
-    status_str = strsep(&line, " ");   // 200
-    if (!status_str) return -6;
-
-    if (strcmp(status_str, "200") != 0)
+    int code = parse_status_code(raw);
+    if (code < 0)
+        return -6;
+    if (code != 200)
         return -5;
 
-    // Headers
-    while (p && *p) {
-        line = strsep(&p, "\r\n");
-        if (!line) return -6;
-        if (line[0] == '\0') break; // end headers
+    size_t headers_len = (size_t)(header_end - raw);
+    char *headers = raw;
+    headers[headers_len] = '\0';
 
-        if (!strncmp(line, "Content-Length: ", 16)) {
-            if (kstrtoint(line + 16, 0, &content_length))
-                return -6;
-        }
-    }
+    int content_length = -1;
+    if (find_content_length(headers, &content_length) != 0)
+        return -6;
 
-    if (content_length < (int)sizeof(int64_t)) return -7;
-    if (!p) return -6;
+    char *body = header_end + header_sep;
+    if (!body)
+        return -6;
 
-    // Body: [8 bytes ret][payload]
-    if ((size_t)content_length > raw_size) {
-        // not fatal, but likely incomplete read
-        // continue with what we have
-    }
+    size_t have_body = raw_size - (size_t)(body - raw);
+    if ((size_t)content_length > have_body)
+        return -7;
 
-    if (content_length - (int)sizeof(int64_t) > (int)resp_size)
+    if (content_length < (int)sizeof(int64_t))
+        return -7;
+
+    int payload_len = content_length - (int)sizeof(int64_t);
+    if ((size_t)payload_len > resp_size)
         return -ENOSPC;
 
     int64_t ret_val;
-    memcpy(&ret_val, p, sizeof(int64_t));
-    p += sizeof(int64_t);
+    memcpy(&ret_val, body, sizeof(int64_t));
 
-    int payload_len = content_length - (int)sizeof(int64_t);
-    if (payload_len > 0) {
-        memcpy(resp, p, payload_len);
-    }
+    if (payload_len > 0)
+        memcpy(resp, body + sizeof(int64_t), (size_t)payload_len);
 
     return ret_val;
 }
@@ -152,7 +190,8 @@ int64_t vtfs_http_call(const char *token, const char *method,
     int error;
 
     error = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
-    if (error < 0) return -1;
+    if (error < 0)
+        return -1;
 
     memset(&saddr, 0, sizeof(saddr));
     saddr.sin_family = AF_INET;
@@ -189,7 +228,6 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -3;
     }
 
-    // +1 for '\0' so strsep works safely
     char *raw_buffer = kmalloc(buffer_size + 1024 + 1, GFP_KERNEL);
     if (!raw_buffer) {
         kernel_sock_shutdown(sock, SHUT_RDWR);
@@ -207,17 +245,15 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -4;
     }
 
-    raw_buffer[read_bytes] = '\0'; // ensure terminated
+    raw_buffer[read_bytes] = '\0';
+    memset(response_buffer, 0, buffer_size);
+
     ret = parse_http_response(raw_buffer, (size_t)read_bytes, response_buffer, buffer_size);
+
     kfree(raw_buffer);
     return ret;
 }
 
-/*
- * URL-encode bytes:
- * - keep [0-9a-zA-Z] as is
- * - everything else -> %XX
- */
 void encode_n(const char *src, size_t len, char *dst)
 {
     for (size_t i = 0; i < len; i++) {
@@ -236,6 +272,9 @@ void encode_n(const char *src, size_t len, char *dst)
 
 void encode(const char *src, char *dst)
 {
-    if (!src) { *dst = '\0'; return; }
+    if (!src) {
+        *dst = '\0';
+        return;
+    }
     encode_n(src, strlen(src), dst);
 }

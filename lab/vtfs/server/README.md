@@ -1,1 +1,0 @@
-# ts-koa-template
