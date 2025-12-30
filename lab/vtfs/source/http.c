@@ -66,11 +66,13 @@ static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
     int total = 0;
 
     while (total < buffer_size) {
+        int ret;
+
         memset(&msg, 0, sizeof(msg));
         vec.iov_base = buffer + total;
         vec.iov_len = buffer_size - total;
 
-        int ret = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
+        ret = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
         if (ret == 0) break;
         if (ret < 0) return ret;
 
@@ -113,16 +115,18 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
     if (content_length - (int)sizeof(int64_t) > (int)resp_size)
         return -ENOSPC;
 
-    int64_t ret_val;
-    memcpy(&ret_val, p, sizeof(int64_t));
-    p += sizeof(int64_t);
+    {
+        int64_t ret_val;
+        int payload_len = content_length - (int)sizeof(int64_t);
 
-    int payload_len = content_length - (int)sizeof(int64_t);
-    if (payload_len > 0) {
-        memcpy(resp, p, payload_len);
+        memcpy(&ret_val, p, sizeof(int64_t));
+        p += sizeof(int64_t);
+
+        if (payload_len > 0)
+            memcpy(resp, p, payload_len);
+
+        return ret_val;
     }
-
-    return ret_val;
 }
 
 int64_t vtfs_http_call(const char *token, const char *method,
@@ -148,50 +152,60 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -2;
     }
 
-    struct kvec vec;
-    va_list args;
-    va_start(args, arg_size);
-    error = fill_request(&vec, token, method, arg_size, args);
-    va_end(args);
+    {
+        struct kvec vec;
+        va_list args;
 
-    if (error) {
-        kernel_sock_shutdown(sock, SHUT_RDWR);
-        sock_release(sock);
-        return error;
+        va_start(args, arg_size);
+        error = fill_request(&vec, token, method, arg_size, args);
+        va_end(args);
+
+        if (error) {
+            kernel_sock_shutdown(sock, SHUT_RDWR);
+            sock_release(sock);
+            return error;
+        }
+
+        {
+            struct msghdr msg;
+            memset(&msg, 0, sizeof(msg));
+
+            error = kernel_sendmsg(sock, &msg, &vec, 1, vec.iov_len);
+            kfree(vec.iov_base);
+
+            if (error < 0) {
+                kernel_sock_shutdown(sock, SHUT_RDWR);
+                sock_release(sock);
+                return -3;
+            }
+        }
     }
 
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
+    {
+        char *raw_buffer = kmalloc(buffer_size + 1024 + 1, GFP_KERNEL);
+        int read_bytes;
 
-    error = kernel_sendmsg(sock, &msg, &vec, 1, vec.iov_len);
-    kfree(vec.iov_base);
+        if (!raw_buffer) {
+            kernel_sock_shutdown(sock, SHUT_RDWR);
+            sock_release(sock);
+            return -ENOMEM;
+        }
+        memset(raw_buffer, 0, buffer_size + 1024 + 1);
 
-    if (error < 0) {
+        read_bytes = receive_all(sock, raw_buffer, buffer_size + 1024);
         kernel_sock_shutdown(sock, SHUT_RDWR);
         sock_release(sock);
-        return -3;
-    }
 
-    char *raw_buffer = kmalloc(buffer_size + 1024 + 1, GFP_KERNEL);
-    if (!raw_buffer) {
-        kernel_sock_shutdown(sock, SHUT_RDWR);
-        sock_release(sock);
-        return -ENOMEM;
-    }
-    memset(raw_buffer, 0, buffer_size + 1024 + 1);
+        if (read_bytes < 0) {
+            kfree(raw_buffer);
+            return -4;
+        }
 
-    int read_bytes = receive_all(sock, raw_buffer, buffer_size + 1024);
-    kernel_sock_shutdown(sock, SHUT_RDWR);
-    sock_release(sock);
-
-    if (read_bytes < 0) {
+        raw_buffer[read_bytes] = '\0';
+        ret = parse_http_response(raw_buffer, (size_t)read_bytes, response_buffer, buffer_size);
         kfree(raw_buffer);
-        return -4;
     }
 
-    raw_buffer[read_bytes] = '\0';
-    ret = parse_http_response(raw_buffer, (size_t)read_bytes, response_buffer, buffer_size);
-    kfree(raw_buffer);
     return ret;
 }
 
