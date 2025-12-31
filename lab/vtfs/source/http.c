@@ -10,6 +10,7 @@
 #include <linux/string.h>
 #include <linux/stdarg.h>
 #include <linux/jiffies.h>
+#include <linux/ctype.h>
 
 #include <net/sock.h>
 
@@ -96,35 +97,133 @@ static int send_all(struct socket *sock, const char *buf, size_t len)
     return 0;
 }
 
-static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
-{
-    struct msghdr msg;
-    struct kvec vec;
-    int total = 0;
-
-    while (total < (int)buffer_size) {
-        memset(&msg, 0, sizeof(msg));
-        vec.iov_base = buffer + total;
-        vec.iov_len  = buffer_size - (size_t)total;
-
-        int ret = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
-        if (ret == 0) break;
-        if (ret < 0) return ret;
-
-        total += ret;
-    }
-    return total;
-}
-
 static const char *find_hdr(const char *hdrs, const char *key)
 {
     return strstr(hdrs, key);
 }
 
-static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_t resp_size)
+/* parse Content-Length from NUL-terminated header block */
+static int parse_content_length(const char *raw, int *out_len)
+{
+    const char *cl = find_hdr(raw, "Content-Length:");
+    int v = -1;
+
+    if (!cl) return -ENOENT;
+
+    cl += strlen("Content-Length:");
+    while (*cl == ' ' || *cl == '\t') cl++;
+
+    /* parse digits */
+    if (!isdigit(*cl)) return -EINVAL;
+    v = 0;
+    while (isdigit(*cl)) {
+        v = v * 10 + (*cl - '0');
+        cl++;
+        if (v > (1024 * 1024)) break; /* hard guard */
+    }
+
+    *out_len = v;
+    return 0;
+}
+
+/*
+ * Read until:
+ *  - have \r\n\r\n
+ *  - parsed Content-Length
+ *  - received header_size + content_length bytes
+ *
+ * IMPORTANT: we always keep buffer NUL-terminated (so strstr/sscanf are safe).
+ */
+static int recv_http_response(struct socket *sock, char **out, size_t *out_len)
+{
+    const size_t CHUNK = 4096;
+    const size_t HARD_MAX = 256 * 1024; /* 256KB cap */
+    char *buf = NULL;
+    size_t cap = 0;
+    size_t total = 0;
+    int content_length = -1;
+    char *hdr_end = NULL;
+
+    buf = kmalloc(CHUNK + 1, GFP_KERNEL);
+    if (!buf) return -ENOMEM;
+    cap = CHUNK + 1;
+    total = 0;
+    buf[0] = '\0';
+
+    while (1) {
+        struct msghdr msg;
+        struct kvec vec;
+        int ret;
+
+        if (total + CHUNK + 1 > cap) {
+            size_t new_cap = cap * 2;
+            if (new_cap < total + CHUNK + 1) new_cap = total + CHUNK + 1;
+            if (new_cap > HARD_MAX + 1) new_cap = HARD_MAX + 1;
+
+            if (new_cap <= cap) {
+                http_warn("response too large (cap=%zu)", cap);
+                kfree(buf);
+                return -ENOSPC;
+            }
+
+            buf = krealloc(buf, new_cap, GFP_KERNEL);
+            if (!buf) return -ENOMEM;
+            cap = new_cap;
+        }
+
+        memset(&msg, 0, sizeof(msg));
+        vec.iov_base = buf + total;
+        vec.iov_len  = cap - total - 1; /* keep 1 byte for NUL */
+
+        ret = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
+        if (ret < 0) {
+            kfree(buf);
+            return ret;
+        }
+        if (ret == 0) {
+            /* connection closed */
+            break;
+        }
+
+        total += (size_t)ret;
+        buf[total] = '\0'; /* CRITICAL */
+
+        if (!hdr_end) {
+            hdr_end = strstr(buf, "\r\n\r\n");
+            if (hdr_end) {
+                int tmp;
+                if (parse_content_length(buf, &tmp) == 0) {
+                    content_length = tmp;
+                }
+            }
+        }
+
+        if (hdr_end && content_length >= 0) {
+            size_t hdr_size = (size_t)(hdr_end + 4 - buf);
+            size_t need = hdr_size + (size_t)content_length;
+            if (total >= need) {
+                /* we have full body */
+                break;
+            }
+        }
+
+        if (total >= HARD_MAX) {
+            http_warn("response reached hard max=%zu", (size_t)HARD_MAX);
+            break;
+        }
+    }
+
+    *out = buf;
+    *out_len = total;
+    return 0;
+}
+
+static int64_t parse_http_response(char *raw, size_t raw_size,
+                                  char *resp, size_t resp_size)
 {
     char *hdr_end = strstr(raw, "\r\n\r\n");
     if (!hdr_end) return -6;
+
     char *body = hdr_end + 4;
 
     int code = 0;
@@ -132,16 +231,7 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
     if (code != 200) return -5;
 
     int content_length = -1;
-    {
-        const char *cl = find_hdr(raw, "Content-Length:");
-        if (cl) {
-            cl += strlen("Content-Length:");
-            while (*cl == ' ') cl++;
-            if (kstrtoint(cl, 10, &content_length))
-                return -6;
-        }
-    }
-
+    if (parse_content_length(raw, &content_length) != 0) return -6;
     if (content_length < 0) return -6;
 
     size_t hdr_size = (size_t)(body - raw);
@@ -157,7 +247,15 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
 
     if ((size_t)payload_len > resp_size) return -ENOSPC;
 
-    memcpy(resp, body + sizeof(int64_t), (size_t)payload_len);
+    if (payload_len > 0)
+        memcpy(resp, body + sizeof(int64_t), (size_t)payload_len);
+
+    /* convenience: try to NUL-terminate if space */
+    if ((size_t)payload_len < resp_size)
+        resp[payload_len] = '\0';
+    else if (resp_size > 0)
+        resp[resp_size - 1] = '\0';
+
     return rc;
 }
 
@@ -169,7 +267,6 @@ int64_t vtfs_http_call(const char *token, const char *method,
     struct sockaddr_in saddr;
     int error;
     int64_t ret;
-
     unsigned long t0 = jiffies;
 
     error = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
@@ -220,28 +317,30 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -3;
     }
 
-    char *raw = kmalloc(buffer_size + 2048, GFP_KERNEL);
-    if (!raw) {
-        kernel_sock_shutdown(sock, SHUT_RDWR);
-        sock_release(sock);
-        return -ENOMEM;
-    }
+    char *raw = NULL;
+    size_t raw_len = 0;
 
-    int read_bytes = receive_all(sock, raw, buffer_size + 2048);
+    error = recv_http_response(sock, &raw, &raw_len);
+
     kernel_sock_shutdown(sock, SHUT_RDWR);
     sock_release(sock);
 
-    if (read_bytes < 0) {
-        http_warn("recv failed=%d method=%s", read_bytes, method);
+    if (error < 0) {
+        http_warn("recv_http_response failed=%d method=%s", error, method);
         kfree(raw);
         return -4;
     }
 
-    ret = parse_http_response(raw, (size_t)read_bytes, response_buffer, buffer_size);
+    if (!raw || raw_len == 0) {
+        kfree(raw);
+        return -4;
+    }
+
+    ret = parse_http_response(raw, raw_len, response_buffer, buffer_size);
     kfree(raw);
 
     if (ret < 0) {
-        http_warn("parse resp rc=%lld method=%s bytes=%d", (long long)ret, method, read_bytes);
+        http_warn("parse resp rc=%lld method=%s bytes=%zu", (long long)ret, method, raw_len);
     } else {
         http_dbg("ok method=%s rc=%lld time_ms=%u",
                  method, (long long)ret, jiffies_to_msecs(jiffies - t0));
