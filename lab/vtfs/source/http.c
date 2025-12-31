@@ -11,13 +11,23 @@
 #include <linux/stdarg.h>
 #include <linux/jiffies.h>
 
-#include <net/sock.h>   // sock->sk timeouts
+#include <net/sock.h>
 
 #include "http.h"
 
 MODULE_LICENSE("GPL");
 
-// module params (can be passed to insmod)
+/* ========= logging ========= */
+static int debug_http = 1; /* 0=off, 1=info, 2=debug */
+module_param(debug_http, int, 0644);
+MODULE_PARM_DESC(debug_http, "VTFS http debug level (0=off,1=info,2=debug)");
+
+#define http_info(fmt, ...) do { if (debug_http >= 1) pr_info("vtfs:http: " fmt "\n", ##__VA_ARGS__); } while (0)
+#define http_dbg(fmt, ...)  do { if (debug_http >= 2) pr_info("vtfs:http: [dbg] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define http_warn(fmt, ...) pr_warn("vtfs:http: [warn] " fmt "\n", ##__VA_ARGS__)
+#define http_err(fmt, ...)  pr_err ("vtfs:http: [err] " fmt "\n", ##__VA_ARGS__)
+
+/* module params */
 static char *server_ip = "192.168.56.1";
 static int server_port = 8089;
 
@@ -98,8 +108,8 @@ static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
         vec.iov_len  = buffer_size - (size_t)total;
 
         int ret = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
-        if (ret == 0) break;      // EOF
-        if (ret < 0) return ret;  // error
+        if (ret == 0) break;
+        if (ret < 0) return ret;
 
         total += ret;
     }
@@ -108,23 +118,19 @@ static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
 
 static const char *find_hdr(const char *hdrs, const char *key)
 {
-    // very simple case-sensitive search (server is predictable for this lab)
     return strstr(hdrs, key);
 }
 
 static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_t resp_size)
 {
-    // find header/body split
     char *hdr_end = strstr(raw, "\r\n\r\n");
     if (!hdr_end) return -6;
     char *body = hdr_end + 4;
 
-    // status code
     int code = 0;
     if (sscanf(raw, "HTTP/%*s %d", &code) != 1) return -6;
     if (code != 200) return -5;
 
-    // Content-Length
     int content_length = -1;
     {
         const char *cl = find_hdr(raw, "Content-Length:");
@@ -138,7 +144,6 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
 
     if (content_length < 0) return -6;
 
-    // sanity: do we have the body fully in raw?
     size_t hdr_size = (size_t)(body - raw);
     if (hdr_size + (size_t)content_length > raw_size) return -6;
 
@@ -165,8 +170,13 @@ int64_t vtfs_http_call(const char *token, const char *method,
     int error;
     int64_t ret;
 
+    unsigned long t0 = jiffies;
+
     error = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
-    if (error < 0) return -1;
+    if (error < 0) {
+        http_err("sock_create_kern failed=%d", error);
+        return -1;
+    }
 
     if (sock && sock->sk) {
         sock->sk->sk_rcvtimeo = msecs_to_jiffies(2000);
@@ -180,6 +190,7 @@ int64_t vtfs_http_call(const char *token, const char *method,
 
     error = kernel_connect(sock, (struct sockaddr *)&saddr, sizeof(saddr), 0);
     if (error < 0) {
+        http_warn("connect %s:%d failed=%d", server_ip, server_port, error);
         sock_release(sock);
         return -2;
     }
@@ -191,15 +202,19 @@ int64_t vtfs_http_call(const char *token, const char *method,
     va_end(args);
 
     if (error) {
+        http_err("fill_request failed=%d method=%s", error, method);
         kernel_sock_shutdown(sock, SHUT_RDWR);
         sock_release(sock);
         return error;
     }
 
+    http_dbg("send %s len=%zu", method, vec.iov_len);
+
     error = send_all(sock, (const char *)vec.iov_base, vec.iov_len);
     kfree(vec.iov_base);
 
     if (error < 0) {
+        http_warn("send_all failed=%d method=%s", error, method);
         kernel_sock_shutdown(sock, SHUT_RDWR);
         sock_release(sock);
         return -3;
@@ -217,12 +232,21 @@ int64_t vtfs_http_call(const char *token, const char *method,
     sock_release(sock);
 
     if (read_bytes < 0) {
+        http_warn("recv failed=%d method=%s", read_bytes, method);
         kfree(raw);
         return -4;
     }
 
     ret = parse_http_response(raw, (size_t)read_bytes, response_buffer, buffer_size);
     kfree(raw);
+
+    if (ret < 0) {
+        http_warn("parse resp rc=%lld method=%s bytes=%d", (long long)ret, method, read_bytes);
+    } else {
+        http_dbg("ok method=%s rc=%lld time_ms=%u",
+                 method, (long long)ret, jiffies_to_msecs(jiffies - t0));
+    }
+
     return ret;
 }
 

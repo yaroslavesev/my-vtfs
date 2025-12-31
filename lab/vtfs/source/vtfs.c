@@ -8,20 +8,36 @@
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
 #include <linux/timekeeping.h>
+#include <linux/atomic.h>
+#include <linux/pagemap.h>
 
 #include "http.h"
 
 #define MODULE_NAME "vtfs"
 #define VTFS_ROOT_INO 100
+#define VTFS_MAGIC 0x56544653 /* 'VTFS' */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("secs-dev");
 MODULE_DESCRIPTION("VTFS");
 
-// module param: token (fixes "unknown parameter 'token'")
+/* ========= logging ========= */
+static int debug = 1; /* 0=off, 1=info, 2=debug */
+module_param(debug, int, 0644);
+MODULE_PARM_DESC(debug, "VTFS debug level (0=off,1=info,2=debug)");
+
+#define vtfs_info(fmt, ...)  do { if (debug >= 1) pr_info("vtfs: " fmt "\n", ##__VA_ARGS__); } while (0)
+#define vtfs_dbg(fmt, ...)   do { if (debug >= 2) pr_info("vtfs: [dbg] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define vtfs_warn(fmt, ...)  pr_warn("vtfs: [warn] " fmt "\n", ##__VA_ARGS__)
+#define vtfs_err(fmt, ...)   pr_err ("vtfs: [err] " fmt "\n", ##__VA_ARGS__)
+
+/* ========= module param: token ========= */
 static char *token = "my_token";
 module_param(token, charp, 0644);
 MODULE_PARM_DESC(token, "VTFS auth token");
+
+/* ========= state ========= */
+static atomic_t vtfs_unmounting = ATOMIC_INIT(0);
 
 struct vtfs_file_content {
     char *data;
@@ -36,6 +52,7 @@ struct vtfs_file_info {
     umode_t mode;
     bool is_dir;
     bool deleted;                 // IMPORTANT: never free nodes while mounted
+    struct inode *inode;          // cache inode to avoid duplicates
     struct list_head list;
     struct vtfs_file_content content;
     struct mutex lock;
@@ -53,7 +70,7 @@ static int vtfs_fill_super(struct super_block *sb, void *data, int silent);
 static struct dentry *vtfs_mount(struct file_system_type *fs_type, int flags, const char *dev_name, void *data);
 static void vtfs_kill_sb(struct super_block *sb);
 
-static struct inode *vtfs_get_inode(struct super_block *sb, const struct inode *dir, umode_t mode, int i_ino);
+static struct inode *vtfs_get_inode(struct super_block *sb, umode_t mode, int i_ino, struct vtfs_file_info *fi);
 static struct dentry *vtfs_lookup(struct inode *parent_inode, struct dentry *child_dentry, unsigned int flags);
 static int vtfs_iterate(struct file *filp, struct dir_context *ctx);
 
@@ -65,10 +82,35 @@ static int vtfs_rmdir(struct inode *parent_inode, struct dentry *child_dentry);
 static ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset);
 static ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t length, loff_t *offset);
 
+static int vtfs_open(struct inode *inode, struct file *filp);
+static int vtfs_release(struct inode *inode, struct file *filp);
+
+/* ---- super ops (critical for unmount diagnostics) ---- */
+static void vtfs_put_super(struct super_block *sb);
+static void vtfs_evict_inode(struct inode *inode);
+
+static const struct super_operations vtfs_sops = {
+    .statfs      = simple_statfs,
+    .drop_inode  = generic_delete_inode,
+    .put_super   = vtfs_put_super,
+    .evict_inode = vtfs_evict_inode,
+};
+
 /* ---- helpers ---- */
 static void ino_to_str(ino_t ino, char *buf, size_t n)
 {
     snprintf(buf, n, "%llu", (unsigned long long)ino);
+}
+
+static void vtfs_dump_files_locked(void)
+{
+    struct vtfs_file_info *fi;
+    int cnt = 0;
+    list_for_each_entry(fi, &vtfs_files, list) {
+        if (fi->deleted) continue;
+        cnt++;
+    }
+    vtfs_info("live nodes=%d next_ino=%d unmounting=%d", cnt, next_ino, atomic_read(&vtfs_unmounting));
 }
 
 /* ---- ops tables ---- */
@@ -83,11 +125,15 @@ static const struct inode_operations vtfs_inode_ops = {
 
 static const struct file_operations vtfs_dir_ops = {
     .iterate_shared = vtfs_iterate,
+    .open           = vtfs_open,
+    .release        = vtfs_release,
 };
 
 static const struct file_operations vtfs_file_ops = {
-    .read  = vtfs_read,
-    .write = vtfs_write,
+    .read    = vtfs_read,
+    .write   = vtfs_write,
+    .open    = vtfs_open,
+    .release = vtfs_release,
 };
 
 static struct file_system_type vtfs_fs_type = {
@@ -97,7 +143,7 @@ static struct file_system_type vtfs_fs_type = {
 };
 
 /* ---- inode ---- */
-static struct inode *vtfs_get_inode(struct super_block *sb, const struct inode *dir, umode_t mode, int i_ino)
+static struct inode *vtfs_get_inode(struct super_block *sb, umode_t mode, int i_ino, struct vtfs_file_info *fi)
 {
     struct inode *inode = new_inode(sb);
     if (!inode) return NULL;
@@ -118,7 +164,24 @@ static struct inode *vtfs_get_inode(struct super_block *sb, const struct inode *
     inode->i_op = &vtfs_inode_ops;
     inode->i_fop = S_ISDIR(mode) ? &vtfs_dir_ops : &vtfs_file_ops;
 
+    inode->i_private = fi; /* crucial for debugging */
     return inode;
+}
+
+/* ---- open/release ---- */
+static int vtfs_open(struct inode *inode, struct file *filp)
+{
+    struct vtfs_file_info *fi = (struct vtfs_file_info *)inode->i_private;
+    filp->private_data = fi;
+    vtfs_dbg("open ino=%lu mode=%o fi=%p", inode->i_ino, inode->i_mode, fi);
+    return 0;
+}
+
+static int vtfs_release(struct inode *inode, struct file *filp)
+{
+    vtfs_dbg("release ino=%lu", inode->i_ino);
+    filp->private_data = NULL;
+    return 0;
 }
 
 /* ---- finders ---- */
@@ -159,15 +222,32 @@ static struct dentry *vtfs_lookup(struct inode *parent_inode, struct dentry *chi
     struct vtfs_file_info *fi = find_file_in_dir(child_dentry->d_name.name, parent_inode->i_ino);
 
     if (!fi) {
-        // negative dentry
         d_add(child_dentry, NULL);
         return NULL;
     }
 
-    struct inode *inode = vtfs_get_inode(parent_inode->i_sb, parent_inode, fi->mode, fi->ino);
-    if (!inode) return ERR_PTR(-ENOMEM);
+    /* reuse cached inode if possible */
+    if (fi->inode) {
+        struct inode *inode = igrab(fi->inode);
+        if (inode) {
+            d_add(child_dentry, inode);
+            vtfs_dbg("lookup reuse name=%s parent=%lu ino=%lu", child_dentry->d_name.name, parent_inode->i_ino, inode->i_ino);
+            return NULL;
+        }
+    }
 
-    d_add(child_dentry, inode);
+    {
+        struct inode *inode = vtfs_get_inode(parent_inode->i_sb, fi->mode, fi->ino, fi);
+        if (!inode) return ERR_PTR(-ENOMEM);
+
+        mutex_lock(&vtfs_files_lock);
+        fi->inode = inode;
+        mutex_unlock(&vtfs_files_lock);
+
+        d_add(child_dentry, inode);
+        vtfs_dbg("lookup new name=%s parent=%lu ino=%lu", child_dentry->d_name.name, parent_inode->i_ino, inode->i_ino);
+    }
+
     return NULL;
 }
 
@@ -189,7 +269,6 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
         ctx->pos = 2;
     }
 
-    // standard iterate: emit all remaining entries; do NOT hold lock during dir_emit
     while (1) {
         char name[256];
         ino_t ino_out = 0;
@@ -233,7 +312,7 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
 static ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t length, loff_t *offset)
 {
     struct inode *inode = filp->f_inode;
-    struct vtfs_file_info *fi = find_file_info(inode->i_ino);
+    struct vtfs_file_info *fi = filp->private_data ? filp->private_data : find_file_info(inode->i_ino);
     if (!fi) return -ENOENT;
 
     mutex_lock(&fi->lock);
@@ -253,8 +332,7 @@ static ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t length, 
     *offset += (loff_t)length;
     mutex_unlock(&fi->lock);
 
-    // notify server (optional)
-    {
+    if (!atomic_read(&vtfs_unmounting)) {
         char response[256] = {0};
         char parent_ino_str[32];
         char name_enc[3 * 256 + 1];
@@ -264,6 +342,8 @@ static ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t length, 
 
         (void)vtfs_http_call(token, "read", response, sizeof(response),
                              2, "parent_ino", parent_ino_str, "name", name_enc);
+    } else {
+        vtfs_dbg("skip http read (unmounting) ino=%lu", inode->i_ino);
     }
 
     return (ssize_t)length;
@@ -272,10 +352,9 @@ static ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t length, 
 static ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t length, loff_t *offset)
 {
     struct inode *inode = filp->f_inode;
-    struct vtfs_file_info *fi = find_file_info(inode->i_ino);
+    struct vtfs_file_info *fi = filp->private_data ? filp->private_data : find_file_info(inode->i_ino);
     if (!fi) return -ENOENT;
 
-    // read user data first
     char *tmp = kmalloc(length, GFP_KERNEL);
     if (!tmp) return -ENOMEM;
 
@@ -326,7 +405,6 @@ static ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t l
 
     inode_set_mtime_to_ts(inode, current_time(inode));
 
-    // prepare encoded payload (limit to 1024 bytes)
     size_t send_len = fi->content.size;
     if (send_len > 1024) send_len = 1024;
 
@@ -344,12 +422,14 @@ static ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t l
 
     mutex_unlock(&fi->lock);
 
-    if (data_enc) {
+    if (!atomic_read(&vtfs_unmounting) && data_enc) {
         (void)vtfs_http_call(token, "write", response, sizeof(response),
                              3, "parent_ino", parent_ino_str, "name", name_enc, "data", data_enc);
-        kfree(data_enc);
+    } else {
+        vtfs_dbg("skip http write (unmounting=%d) ino=%lu", atomic_read(&vtfs_unmounting), inode->i_ino);
     }
 
+    kfree(data_enc);
     kfree(tmp);
     return (ssize_t)length;
 }
@@ -377,9 +457,8 @@ static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode, stru
     list_add(&fi->list, &vtfs_files);
     mutex_unlock(&vtfs_files_lock);
 
-    struct inode *inode = vtfs_get_inode(parent_inode->i_sb, parent_inode, fi->mode, fi->ino);
+    struct inode *inode = vtfs_get_inode(parent_inode->i_sb, fi->mode, fi->ino, fi);
     if (!inode) {
-        // cleanup inserted node
         mutex_lock(&vtfs_files_lock);
         list_del(&fi->list);
         mutex_unlock(&vtfs_files_lock);
@@ -387,10 +466,13 @@ static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode, stru
         return -ENOMEM;
     }
 
+    mutex_lock(&vtfs_files_lock);
+    fi->inode = inode;
+    mutex_unlock(&vtfs_files_lock);
+
     d_add(child_dentry, inode);
 
-    // notify server
-    {
+    if (!atomic_read(&vtfs_unmounting)) {
         char response[256] = {0};
         char parent_ino_str[32];
         char name_enc[3 * 256 + 1];
@@ -402,6 +484,7 @@ static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode, stru
                              3, "parent_ino", parent_ino_str, "name", name_enc, "data", "");
     }
 
+    vtfs_dbg("create name=%s parent=%lu ino=%lu", name, parent_ino, inode->i_ino);
     return 0;
 }
 
@@ -410,7 +493,6 @@ static int vtfs_unlink(struct inode *parent_inode, struct dentry *child_dentry)
     const char *name = child_dentry->d_name.name;
     ino_t parent_ino = parent_inode->i_ino;
 
-    // DO NOT FREE nodes here, just mark deleted
     mutex_lock(&vtfs_files_lock);
     {
         struct vtfs_file_info *fi;
@@ -430,8 +512,7 @@ static int vtfs_unlink(struct inode *parent_inode, struct dentry *child_dentry)
     }
     mutex_unlock(&vtfs_files_lock);
 
-    // notify server
-    {
+    if (!atomic_read(&vtfs_unmounting)) {
         char response[256] = {0};
         char parent_ino_str[32];
         char name_enc[3 * 256 + 1];
@@ -443,6 +524,7 @@ static int vtfs_unlink(struct inode *parent_inode, struct dentry *child_dentry)
                              2, "parent_ino", parent_ino_str, "name", name_enc);
     }
 
+    vtfs_dbg("unlink name=%s parent=%lu", name, parent_ino);
     return simple_unlink(parent_inode, child_dentry);
 }
 
@@ -458,34 +540,33 @@ static int vtfs_mkdir(struct mnt_idmap *idmap, struct inode *parent_inode, struc
     new_ino = next_ino++;
     mutex_unlock(&vtfs_files_lock);
 
-    struct inode *inode = vtfs_get_inode(parent_inode->i_sb, parent_inode, S_IFDIR | 0777, new_ino);
-    if (!inode) return -ENOMEM;
-
-    inc_nlink(parent_inode);
-
     struct vtfs_file_info *fi = kzalloc(sizeof(*fi), GFP_KERNEL);
-    if (!fi) {
-        drop_nlink(parent_inode);
-        iput(inode);
-        return -ENOMEM;
-    }
+    if (!fi) return -ENOMEM;
 
     mutex_init(&fi->lock);
     fi->is_dir = true;
     fi->deleted = false;
     fi->parent_ino = parent_ino;
-    fi->ino = inode->i_ino;
+    fi->ino = (ino_t)new_ino;
     fi->mode = S_IFDIR | 0777;
     strscpy(fi->name, name, sizeof(fi->name));
 
+    struct inode *inode = vtfs_get_inode(parent_inode->i_sb, fi->mode, fi->ino, fi);
+    if (!inode) {
+        kfree(fi);
+        return -ENOMEM;
+    }
+
+    inc_nlink(parent_inode);
+
     mutex_lock(&vtfs_files_lock);
+    fi->inode = inode;
     list_add(&fi->list, &vtfs_files);
     mutex_unlock(&vtfs_files_lock);
 
     d_add(child_dentry, inode);
 
-    // notify server
-    {
+    if (!atomic_read(&vtfs_unmounting)) {
         char response[256] = {0};
         char parent_ino_str[32];
         char name_enc[3 * 256 + 1];
@@ -497,6 +578,7 @@ static int vtfs_mkdir(struct mnt_idmap *idmap, struct inode *parent_inode, struc
                              2, "parent_ino", parent_ino_str, "name", name_enc);
     }
 
+    vtfs_dbg("mkdir name=%s parent=%lu ino=%lu", name, parent_ino, inode->i_ino);
     return 0;
 }
 
@@ -507,7 +589,6 @@ static int vtfs_rmdir(struct inode *parent_inode, struct dentry *child_dentry)
 
     if (!simple_empty(child_dentry)) return -ENOTEMPTY;
 
-    // mark deleted, do not free
     mutex_lock(&vtfs_files_lock);
     {
         struct vtfs_file_info *fi;
@@ -522,18 +603,57 @@ static int vtfs_rmdir(struct inode *parent_inode, struct dentry *child_dentry)
     mutex_unlock(&vtfs_files_lock);
 
     drop_nlink(parent_inode);
+    vtfs_dbg("rmdir name=%s parent=%lu", name, parent_ino);
     return simple_rmdir(parent_inode, child_dentry);
+}
+
+/* ---- super ---- */
+static void vtfs_put_super(struct super_block *sb)
+{
+    vtfs_info("put_super sb=%p", sb);
+    atomic_set(&vtfs_unmounting, 1);
+
+    mutex_lock(&vtfs_files_lock);
+    vtfs_dump_files_locked();
+    mutex_unlock(&vtfs_files_lock);
+
+    vtfs_info("put_super done");
+}
+
+static void vtfs_evict_inode(struct inode *inode)
+{
+    struct vtfs_file_info *fi = (struct vtfs_file_info *)inode->i_private;
+
+    vtfs_dbg("evict_inode ino=%lu fi=%p", inode->i_ino, fi);
+
+    truncate_inode_pages_final(&inode->i_data);
+    clear_inode(inode);
+
+    if (fi) {
+        mutex_lock(&vtfs_files_lock);
+        if (fi->inode == inode) fi->inode = NULL;
+        mutex_unlock(&vtfs_files_lock);
+    }
 }
 
 /* ---- mount/super ---- */
 static struct dentry *vtfs_mount(struct file_system_type *fs_type, int flags, const char *dev_name, void *data)
 {
+    vtfs_info("mount flags=0x%x", flags);
+    atomic_set(&vtfs_unmounting, 0);
     return mount_nodev(fs_type, flags, data, vtfs_fill_super);
 }
 
 static int vtfs_fill_super(struct super_block *sb, void *data, int silent)
 {
-    struct inode *inode = vtfs_get_inode(sb, NULL, S_IFDIR | 0777, VTFS_ROOT_INO);
+    vtfs_info("fill_super sb=%p", sb);
+
+    sb->s_magic = VTFS_MAGIC;
+    sb->s_op = &vtfs_sops;
+    sb->s_time_gran = 1;
+    sb->s_maxbytes = MAX_LFS_FILESIZE;
+
+    struct inode *inode = vtfs_get_inode(sb, S_IFDIR | 0777, VTFS_ROOT_INO, NULL);
     if (!inode) return -ENOMEM;
 
     sb->s_root = d_make_root(inode);
@@ -544,22 +664,25 @@ static int vtfs_fill_super(struct super_block *sb, void *data, int silent)
 
 static void vtfs_kill_sb(struct super_block *sb)
 {
-    // do not touch vtfs_files here
+    vtfs_info("kill_sb sb=%p", sb);
+    atomic_set(&vtfs_unmounting, 1);
     kill_litter_super(sb);
+    vtfs_info("kill_sb done");
 }
 
 /* ---- module init/exit ---- */
 static int __init vtfs_init(void)
 {
+    vtfs_info("init token=%s debug=%d", token, debug);
     return register_filesystem(&vtfs_fs_type);
 }
 
 static void __exit vtfs_exit(void)
 {
-    // prevent new mounts first
+    vtfs_info("exit: unregister fs");
     unregister_filesystem(&vtfs_fs_type);
 
-    // assume unmounted before rmmod; now safe to free all nodes
+    vtfs_info("exit: free nodes");
     mutex_lock(&vtfs_files_lock);
     {
         struct vtfs_file_info *fi, *tmp;
@@ -570,6 +693,8 @@ static void __exit vtfs_exit(void)
         }
     }
     mutex_unlock(&vtfs_files_lock);
+
+    vtfs_info("exit done");
 }
 
 module_init(vtfs_init);
