@@ -1,7 +1,5 @@
-#include "http.h"
-
-#include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/socket.h>
 #include <linux/in.h>
@@ -10,50 +8,50 @@
 #include <linux/uio.h>
 #include <linux/errno.h>
 #include <linux/string.h>
+#include <linux/stdarg.h>
 
+#include "http.h"
+
+MODULE_LICENSE("GPL");
+
+// module params (can be passed to insmod)
 static char *server_ip = "192.168.56.1";
 static int server_port = 8089;
 
-module_param(server_ip, charp, 0444);
-MODULE_PARM_DESC(server_ip, "VTFS server IPv4 address");
-module_param(server_port, int, 0444);
-MODULE_PARM_DESC(server_port, "VTFS server TCP port");
+module_param(server_ip, charp, 0644);
+MODULE_PARM_DESC(server_ip, "VTFS server IP");
 
-static int fill_request(struct kvec *vec,
-                        const char *token,
-                        const char *method,
-                        size_t arg_size,
-                        va_list args)
+module_param(server_port, int, 0644);
+MODULE_PARM_DESC(server_port, "VTFS server port");
+
+static int fill_request(struct kvec *vec, const char *token, const char *method,
+                        size_t arg_size, va_list args)
 {
-    /* Запрос строим как строку. Под твой API (GET /api/<method>?token=...&k=v...) */
-    size_t cap = 8192;
-    char *req = kzalloc(cap, GFP_KERNEL);
-    if (!req) return -ENOMEM;
+    // enough for URL + headers
+    char *request_buffer = kzalloc(4096, GFP_KERNEL);
+    if (!request_buffer)
+        return -ENOMEM;
 
-    /* Простейшая "append" без overflow: держим pos */
-    size_t pos = 0;
-    int n = 0;
-
-#define APPEND_FMT(...) do { \
-        n = scnprintf(req + pos, cap - pos, __VA_ARGS__); \
-        if (n < 0 || (size_t)n >= cap - pos) { kfree(req); return -ENOSPC; } \
-        pos += (size_t)n; \
-    } while (0)
-
-    APPEND_FMT("GET /api/%s?token=%s", method, token);
+    strcpy(request_buffer, "GET /api/");
+    strcat(request_buffer, method);
+    strcat(request_buffer, "?token=");
+    strcat(request_buffer, token);
 
     for (size_t i = 0; i < arg_size; i++) {
-        const char *k = va_arg(args, const char *);
-        const char *v = va_arg(args, const char *);
-        APPEND_FMT("&%s=%s", k, v);
+        const char *k = va_arg(args, char *);
+        const char *v = va_arg(args, char *);
+        strcat(request_buffer, "&");
+        strcat(request_buffer, k);
+        strcat(request_buffer, "=");
+        strcat(request_buffer, v);
     }
 
-    APPEND_FMT(" HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", server_ip);
+    strcat(request_buffer, " HTTP/1.1\r\nHost: ");
+    strcat(request_buffer, server_ip);
+    strcat(request_buffer, "\r\nConnection: close\r\n\r\n");
 
-#undef APPEND_FMT
-
-    vec->iov_base = req;
-    vec->iov_len  = pos;
+    vec->iov_base = request_buffer;
+    vec->iov_len  = strlen(request_buffer);
     return 0;
 }
 
@@ -66,101 +64,73 @@ static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
     while (total < (int)buffer_size) {
         memset(&msg, 0, sizeof(msg));
         vec.iov_base = buffer + total;
-        vec.iov_len  = buffer_size - (size_t)total;
+        vec.iov_len  = buffer_size - total;
 
         int ret = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
-        if (ret == 0) break;     /* EOF */
-        if (ret < 0) return ret; /* error */
+        if (ret == 0) break;      // EOF
+        if (ret < 0) return ret;  // error
+
         total += ret;
     }
     return total;
 }
 
-static int find_status_code(const char *raw, int raw_size)
+static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_t resp_size)
 {
-    /* ожидаем "HTTP/1.1 200" */
-    const char *p = raw;
-    const char *end = raw + raw_size;
-    const char *line_end = memchr(p, '\n', end - p);
-    if (!line_end) return -6;
+    char *p = raw;
+    char *line;
+    char *status;
+    int content_length = -1;
 
-    /* вытащим код */
-    /* ищем пробел, затем ещё пробел */
-    const char *sp1 = memchr(p, ' ', line_end - p);
-    if (!sp1) return -6;
-    const char *sp2 = memchr(sp1 + 1, ' ', line_end - (sp1 + 1));
-    if (!sp2) return -6;
+    // status line
+    line = strsep(&p, "\r\n");
+    if (!line) return -6;
 
-    if (sp2 - (sp1 + 1) < 3) return -6;
+    (void)strsep(&line, " ");      // HTTP/1.1
+    status = strsep(&line, " ");   // 200
+    if (!status) return -6;
 
-    char code[4] = {0};
-    memcpy(code, sp1 + 1, 3);
-    return simple_strtol(code, NULL, 10);
-}
+    if (strcmp(status, "200") != 0)
+        return -5;
 
-static int find_content_length(const char *hdr, int hdr_size)
-{
-    const char *p = hdr;
-    const char *end = hdr + hdr_size;
+    // headers
+    while (p && *p) {
+        line = strsep(&p, "\r\n");
+        if (!line) return -6;
+        if (line[0] == '\0') break; // end of headers
 
-    while (p < end) {
-        const char *line_end = memchr(p, '\n', end - p);
-        if (!line_end) break;
-
-        /* пустая строка? (конец заголовков) */
-        if ((line_end == p) || (line_end == p + 1 && *p == '\r')) break;
-
-        if (!strncasecmp(p, "Content-Length:", 15)) {
-            const char *q = p + 15;
-            while (q < line_end && (*q == ' ' || *q == '\t')) q++;
-            return simple_strtol(q, NULL, 10);
-        }
-
-        p = line_end + 1;
-    }
-    return -1;
-}
-
-static int64_t parse_http_response(char *raw, int raw_size,
-                                   char *resp, size_t resp_size)
-{
-    int code = find_status_code(raw, raw_size);
-    if (code != 200) return -5;
-
-    /* найти \r\n\r\n */
-    char *body = NULL;
-    for (int i = 0; i + 3 < raw_size; i++) {
-        if (raw[i] == '\r' && raw[i+1] == '\n' && raw[i+2] == '\r' && raw[i+3] == '\n') {
-            body = raw + i + 4;
-            break;
+        if (!strncmp(line, "Content-Length: ", 16)) {
+            if (kstrtoint(line + 16, 0, &content_length))
+                return -6;
         }
     }
-    if (!body) return -6;
 
-    int hdr_size = (int)(body - raw);
-    int content_length = find_content_length(raw, hdr_size);
-    if (content_length < 0) return -6;
+    if (!p) return -6;
 
-    if (content_length < (int)sizeof(int64_t)) return -7;
+    // body: [int64_t rc][payload...]
+    if (content_length < (int)sizeof(int64_t))
+        return -7;
 
-    int body_avail = raw_size - hdr_size;
-    if (content_length > body_avail) return -6;
+    content_length -= sizeof(int64_t);
+    if (content_length > (int)resp_size)
+        return -ENOSPC;
 
-    int payload_len = content_length - (int)sizeof(int64_t);
-    if ((size_t)payload_len > resp_size) return -ENOSPC;
+    int64_t rc;
+    memcpy(&rc, p, sizeof(int64_t));
+    p += sizeof(int64_t);
 
-    int64_t ret_val;
-    memcpy(&ret_val, body, sizeof(int64_t));
-    memcpy(resp, body + sizeof(int64_t), payload_len);
+    if (p + content_length > raw + raw_size)
+        return -6;
 
-    return ret_val;
+    memcpy(resp, p, content_length);
+    return rc;
 }
 
 int64_t vtfs_http_call(const char *token, const char *method,
                        char *response_buffer, size_t buffer_size,
                        size_t arg_size, ...)
 {
-    struct socket *sock = NULL;
+    struct socket *sock;
     struct sockaddr_in saddr;
     int error;
     int64_t ret;
@@ -170,7 +140,7 @@ int64_t vtfs_http_call(const char *token, const char *method,
 
     memset(&saddr, 0, sizeof(saddr));
     saddr.sin_family = AF_INET;
-    saddr.sin_port = htons((u16)server_port);
+    saddr.sin_port   = htons((u16)server_port);
     saddr.sin_addr.s_addr = in_aton(server_ip);
 
     error = kernel_connect(sock, (struct sockaddr *)&saddr, sizeof(saddr), 0);
@@ -203,16 +173,14 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -3;
     }
 
-    size_t raw_cap = buffer_size + 4096; /* запас под заголовки */
-    char *raw = kmalloc(raw_cap, GFP_KERNEL);
+    char *raw = kmalloc(buffer_size + 1024, GFP_KERNEL);
     if (!raw) {
         kernel_sock_shutdown(sock, SHUT_RDWR);
         sock_release(sock);
         return -ENOMEM;
     }
 
-    int read_bytes = receive_all(sock, raw, raw_cap);
-
+    int read_bytes = receive_all(sock, raw, buffer_size + 1024);
     kernel_sock_shutdown(sock, SHUT_RDWR);
     sock_release(sock);
 
@@ -226,14 +194,14 @@ int64_t vtfs_http_call(const char *token, const char *method,
     return ret;
 }
 
-/* URL-encode: safe chars = [0-9a-zA-Z], остальное -> %XX */
 void encode(const char *src, char *dst)
 {
     while (*src) {
         unsigned char c = (unsigned char)*src;
         if ((c >= '0' && c <= '9') ||
             (c >= 'a' && c <= 'z') ||
-            (c >= 'A' && c <= 'Z')) {
+            (c >= 'A' && c <= 'Z') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
             *dst++ = (char)c;
         } else {
             sprintf(dst, "%%%02X", c);
@@ -250,7 +218,8 @@ void encode_n(const char *src, size_t n, char *dst)
         unsigned char c = (unsigned char)src[i];
         if ((c >= '0' && c <= '9') ||
             (c >= 'a' && c <= 'z') ||
-            (c >= 'A' && c <= 'Z')) {
+            (c >= 'A' && c <= 'Z') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
             *dst++ = (char)c;
         } else {
             sprintf(dst, "%%%02X", c);
