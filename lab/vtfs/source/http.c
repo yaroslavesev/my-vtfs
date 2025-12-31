@@ -39,7 +39,36 @@ MODULE_PARM_DESC(server_ip, "VTFS server IP");
 module_param(server_port, int, 0644);
 MODULE_PARM_DESC(server_port, "VTFS server port");
 
-/* ========= internal helpers ========= */
+/* ========= helpers ========= */
+
+static void dbg_dump_hex_prefix(const char *p, size_t n)
+{
+    if (debug_http < 2) return;
+
+    /* печатаем первые ~160 байт в hex, по 16/строка */
+    size_t lim = min(n, (size_t)160);
+    char line[128];
+
+    for (size_t off = 0; off < lim; off += 16) {
+        size_t chunk = min((size_t)16, lim - off);
+        size_t pos = 0;
+
+        pos += scnprintf(line + pos, sizeof(line) - pos, "raw[%04zx]: ", off);
+        for (size_t i = 0; i < 16; i++) {
+            if (i < chunk) pos += scnprintf(line + pos, sizeof(line) - pos, "%02x ", (unsigned char)p[off + i]);
+            else           pos += scnprintf(line + pos, sizeof(line) - pos, "   ");
+        }
+        pos += scnprintf(line + pos, sizeof(line) - pos, " |");
+        for (size_t i = 0; i < chunk; i++) {
+            unsigned char c = (unsigned char)p[off + i];
+            line[pos++] = isprint(c) ? (char)c : '.';
+        }
+        line[pos++] = '|';
+        line[pos] = '\0';
+
+        http_dbg("%s", line);
+    }
+}
 
 static int fill_request(struct kvec *vec,
                         const char *token,
@@ -47,7 +76,6 @@ static int fill_request(struct kvec *vec,
                         size_t arg_size,
                         va_list args)
 {
-    /* enough for typical GET query; enlarge if needed */
     size_t cap = 8192;
     char *buf = kzalloc(cap, GFP_KERNEL);
     size_t pos = 0;
@@ -103,6 +131,7 @@ static int send_all(struct socket *sock, const char *buf, size_t len)
 
 static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
 {
+    /* buffer_size = реальная ёмкость; мы оставим место под '\0' у вызывающего */
     struct msghdr msg;
     struct kvec vec;
     int total = 0;
@@ -113,7 +142,7 @@ static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
         vec.iov_len  = buffer_size - (size_t)total;
 
         int ret = kernel_recvmsg(sock, &msg, &vec, 1, vec.iov_len, 0);
-        if (ret == 0) break;          /* connection closed */
+        if (ret == 0) break;
         if (ret < 0) return ret;
 
         total += ret;
@@ -126,9 +155,10 @@ static const char *find_hdr(const char *hdrs, const char *key)
     return strstr(hdrs, key);
 }
 
-static void dbg_dump_payload(const char *p, size_t n)
+static void dbg_dump_payload_textish(const char *p, size_t n)
 {
-    /* print as “mostly-text”: replace nonprintables with '.' */
+    if (debug_http < 2) return;
+
     char tmp[256];
     size_t m = min(n, sizeof(tmp) - 1);
 
@@ -142,16 +172,14 @@ static void dbg_dump_payload(const char *p, size_t n)
 }
 
 /*
- * Response format expected from server:
- * HTTP/1.1 200 OK
- * Content-Length: <N>
- *
- * [int64 rc][payload bytes...]
+ * HTTP body: [int64 rc][payload...]
  */
 static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_t resp_size)
 {
+    /* raw гарантированно NUL-terminated вызывающим кодом */
     char *hdr_end = strstr(raw, "\r\n\r\n");
     if (!hdr_end) return -6;
+
     char *body = hdr_end + 4;
 
     int code = 0;
@@ -169,19 +197,15 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
         }
     }
 
+    size_t hdr_size = (size_t)(body - raw);
+
     if (content_length < 0) {
-        /*
-         * Fallback: if server does not send Content-Length (shouldn’t happen),
-         * try to treat remaining bytes as body.
-         */
-        size_t hdr_size = (size_t)(body - raw);
+        /* fallback: всё что после заголовков */
         if (raw_size < hdr_size) return -6;
         content_length = (int)(raw_size - hdr_size);
     }
 
     if (content_length < (int)sizeof(int64_t)) return -7;
-
-    size_t hdr_size = (size_t)(body - raw);
     if (hdr_size + (size_t)content_length > raw_size) return -6;
 
     int64_t rc;
@@ -195,16 +219,13 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
     if (payload_len > 0)
         memcpy(resp, body + sizeof(int64_t), (size_t)payload_len);
 
-    /* Make resp a C-string for debug friendliness */
     if (resp_size > 0) {
         size_t n = (size_t)payload_len;
         if (n >= resp_size) n = resp_size - 1;
         resp[n] = '\0';
     }
 
-    if (debug_http >= 2)
-        dbg_dump_payload(body + sizeof(int64_t), (size_t)payload_len);
-
+    dbg_dump_payload_textish(body + sizeof(int64_t), (size_t)payload_len);
     return rc;
 }
 
@@ -267,15 +288,17 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -3;
     }
 
-    /* raw response buffer: body can be bigger than response_buffer */
-    char *raw = kmalloc(buffer_size + 2048, GFP_KERNEL);
+    /* важно: +1 под NUL */
+    size_t cap = buffer_size + 2048 + 1;
+    char *raw = kmalloc(cap, GFP_KERNEL);
     if (!raw) {
         kernel_sock_shutdown(sock, SHUT_RDWR);
         sock_release(sock);
         return -ENOMEM;
     }
 
-    int read_bytes = receive_all(sock, raw, buffer_size + 2048);
+    /* читаем максимум cap-1, чтобы всегда поставить '\0' */
+    int read_bytes = receive_all(sock, raw, cap - 1);
 
     kernel_sock_shutdown(sock, SHUT_RDWR);
     sock_release(sock);
@@ -285,6 +308,10 @@ int64_t vtfs_http_call(const char *token, const char *method,
         kfree(raw);
         return -4;
     }
+
+    raw[read_bytes] = '\0'; /* КЛЮЧЕВОЙ ФИКС */
+
+    dbg_dump_hex_prefix(raw, (size_t)read_bytes);
 
     ret = parse_http_response(raw, (size_t)read_bytes, response_buffer, buffer_size);
     kfree(raw);
