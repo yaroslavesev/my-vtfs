@@ -254,7 +254,11 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
         /* common JSON keys */
         if (find_key_int64(body, "\"rc\":", &rc)) return rc;
         if (find_key_int64(body, "\"ino\":", &rc)) return rc;
-
+        if (resp_size > 0) {
+            size_t n = (size_t)payload_len;
+            if (n >= resp_size) n = resp_size - 1;
+            resp[n] = '\0';
+        }
         /* body might be just a number */
         if (parse_int64_at(body, &rc)) return rc;
 
