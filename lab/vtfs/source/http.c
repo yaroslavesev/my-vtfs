@@ -186,16 +186,26 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
     if (sscanf(raw, "HTTP/%*s %d", &code) != 1) return -6;
     if (code != 200) return -5;
 
-    int content_length = -1;
-    {
-        const char *cl = find_hdr(raw, "Content-Length:");
-        if (cl) {
-            cl += strlen("Content-Length:");
-            while (*cl == ' ') cl++;
-            if (kstrtoint(cl, 10, &content_length))
-                return -6;
+        int content_length = -1;
+        {
+            const char *cl = find_hdr(raw, "Content-Length:");
+            if (cl) {
+                const char *p = cl + strlen("Content-Length:");
+                while (*p == ' ') p++;
+
+                /* parse digits only */
+                int v = 0;
+                int any = 0;
+                while (*p >= '0' && *p <= '9') {
+                    any = 1;
+                    v = v * 10 + (*p - '0');
+                    p++;
+                }
+                if (!any) return -6;
+                content_length = v;
+            }
         }
-    }
+
 
     size_t hdr_size = (size_t)(body - raw);
 
