@@ -21,6 +21,12 @@
 #define VTFS_SERVER_ROOT_INO 0
 #define VTFS_MAGIC 0x56544653 /* 'VTFS' */
 
+/* stack-usage helpers */
+#define VTFS_INO_STR_MAX    32
+#define VTFS_NAME_MAX       256
+#define VTFS_NAME_ENC_MAX   (3 * VTFS_NAME_MAX + 1)
+#define VTFS_RESP_BIG       4096
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("secs-dev");
 MODULE_DESCRIPTION("VTFS");
@@ -50,7 +56,7 @@ struct vtfs_file_content {
 };
 
 struct vtfs_file_info {
-    char name[256];
+    char name[VTFS_NAME_MAX];
     ino_t ino;
     ino_t parent_ino;              /* LOCAL parent inode number (root=VTFS_ROOT_INO) */
     umode_t mode;
@@ -195,7 +201,7 @@ static int vtfs_parse_list_and_add_children(const char *json, ino_t parent_local
         const char *name_end = strchr(name_k, '"');
         if (!name_end) break;
 
-        char name[256];
+        char name[VTFS_NAME_MAX];
         size_t nlen = (size_t)(name_end - name_k);
         if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
         memcpy(name, name_k, nlen);
@@ -271,7 +277,7 @@ static int vtfs_sync_from_server_dir(ino_t parent_local_ino)
         return 0;
     }
 
-    char parent_ino_str[32];
+    char parent_ino_str[VTFS_INO_STR_MAX];
     ino_to_str(vtfs_to_server_ino(parent_local_ino), parent_ino_str, sizeof(parent_ino_str));
 
     (void)vtfs_http_call(token, "list", resp, resp_sz,
@@ -302,8 +308,8 @@ static int vtfs_fetch_file_from_server(struct vtfs_file_info *fi)
     if (!fi || fi->is_dir) return -EINVAL;
     if (atomic_read(&vtfs_unmounting)) return -EAGAIN;
 
-    char parent_ino_str[32];
-    char name_enc[3 * 256 + 1];
+    char parent_ino_str[VTFS_INO_STR_MAX];
+    char name_enc[VTFS_NAME_ENC_MAX];
 
     ino_to_str(vtfs_to_server_ino(fi->parent_ino), parent_ino_str, sizeof(parent_ino_str));
     encode(fi->name, name_enc);
@@ -502,7 +508,7 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
     }
 
     while (1) {
-        char name[256];
+        char name[VTFS_NAME_MAX];
         ino_t ino_out = 0;
         unsigned char type_out = DT_UNKNOWN;
         bool found = false;
@@ -642,8 +648,8 @@ static ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t l
         return -E2BIG;
     }
 
-    char parent_ino_str[32];
-    char name_enc[3 * 256 + 1];
+    char parent_ino_str[VTFS_INO_STR_MAX];
+    char name_enc[VTFS_NAME_ENC_MAX];
 
     ino_to_str(vtfs_to_server_ino(fi->parent_ino), parent_ino_str, sizeof(parent_ino_str));
     encode(fi->name, name_enc);
@@ -681,24 +687,42 @@ static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode, stru
 
     if (atomic_read(&vtfs_unmounting)) return -EAGAIN;
 
-    /* 1) create on server first to get ino */
-    char response[4096] = {0};
-    char parent_ino_str[32];
-    char name_enc[3 * 256 + 1];
+    /* MOVE BIG BUFFERS OFF STACK */
+    char *response = kmalloc(VTFS_RESP_BIG, GFP_KERNEL);
+    char *name_enc = kmalloc(VTFS_NAME_ENC_MAX, GFP_KERNEL);
+    char parent_ino_str[VTFS_INO_STR_MAX];
 
+    if (!response || !name_enc) {
+        kfree(response);
+        kfree(name_enc);
+        return -ENOMEM;
+    }
+    memset(response, 0, VTFS_RESP_BIG);
+
+    /* 1) create on server first to get ino */
     ino_to_str(vtfs_to_server_ino(parent_ino), parent_ino_str, sizeof(parent_ino_str));
     encode(name, name_enc);
 
-    int64_t rc = vtfs_http_call(token, "create", response, sizeof(response),
+    int64_t rc = vtfs_http_call(token, "create", response, VTFS_RESP_BIG,
                                 3, "parent_ino", parent_ino_str, "name", name_enc, "data", "");
-    if (rc == -1) return -EEXIST;
-    if (rc != 0) return -EIO;
+    kfree(name_enc);
+
+    if (rc == -1) {
+        kfree(response);
+        return -EEXIST;
+    }
+    if (rc != 0) {
+        kfree(response);
+        return -EIO;
+    }
 
     ino_t server_ino = 0;
     if (!vtfs_parse_created_ino(response, &server_ino) || server_ino == 0) {
         vtfs_warn("create: cannot parse ino from server response: %s", response);
+        kfree(response);
         return -EIO;
     }
+    kfree(response);
 
     /* 2) create local node with SAME ino */
     struct vtfs_file_info *fi = kzalloc(sizeof(*fi), GFP_KERNEL);
@@ -762,8 +786,8 @@ static int vtfs_unlink(struct inode *parent_inode, struct dentry *child_dentry)
 
     if (!atomic_read(&vtfs_unmounting)) {
         char response[256] = {0};
-        char parent_ino_str[32];
-        char name_enc[3 * 256 + 1];
+        char parent_ino_str[VTFS_INO_STR_MAX];
+        char name_enc[VTFS_NAME_ENC_MAX];
 
         ino_to_str(vtfs_to_server_ino(parent_ino), parent_ino_str, sizeof(parent_ino_str));
         encode(name, name_enc);
@@ -784,24 +808,42 @@ static int vtfs_mkdir(struct mnt_idmap *idmap, struct inode *parent_inode, struc
     if (find_file_in_dir(name, parent_ino)) return -EEXIST;
     if (atomic_read(&vtfs_unmounting)) return -EAGAIN;
 
-    /* 1) mkdir on server first to get ino */
-    char response[4096] = {0};
-    char parent_ino_str[32];
-    char name_enc[3 * 256 + 1];
+    /* MOVE BIG BUFFERS OFF STACK */
+    char *response = kmalloc(VTFS_RESP_BIG, GFP_KERNEL);
+    char *name_enc = kmalloc(VTFS_NAME_ENC_MAX, GFP_KERNEL);
+    char parent_ino_str[VTFS_INO_STR_MAX];
 
+    if (!response || !name_enc) {
+        kfree(response);
+        kfree(name_enc);
+        return -ENOMEM;
+    }
+    memset(response, 0, VTFS_RESP_BIG);
+
+    /* 1) mkdir on server first to get ino */
     ino_to_str(vtfs_to_server_ino(parent_ino), parent_ino_str, sizeof(parent_ino_str));
     encode(name, name_enc);
 
-    int64_t rc = vtfs_http_call(token, "mkdir", response, sizeof(response),
+    int64_t rc = vtfs_http_call(token, "mkdir", response, VTFS_RESP_BIG,
                                 2, "parent_ino", parent_ino_str, "name", name_enc);
-    if (rc == -1) return -EEXIST;
-    if (rc != 0) return -EIO;
+    kfree(name_enc);
+
+    if (rc == -1) {
+        kfree(response);
+        return -EEXIST;
+    }
+    if (rc != 0) {
+        kfree(response);
+        return -EIO;
+    }
 
     ino_t server_ino = 0;
     if (!vtfs_parse_created_ino(response, &server_ino) || server_ino == 0) {
         vtfs_warn("mkdir: cannot parse ino from server response: %s", response);
+        kfree(response);
         return -EIO;
     }
+    kfree(response);
 
     struct vtfs_file_info *fi = kzalloc(sizeof(*fi), GFP_KERNEL);
     if (!fi) return -ENOMEM;
@@ -856,8 +898,8 @@ static int vtfs_rmdir(struct inode *parent_inode, struct dentry *child_dentry)
 
     if (!atomic_read(&vtfs_unmounting)) {
         char response[256] = {0};
-        char parent_ino_str[32];
-        char name_enc[3 * 256 + 1];
+        char parent_ino_str[VTFS_INO_STR_MAX];
+        char name_enc[VTFS_NAME_ENC_MAX];
 
         ino_to_str(vtfs_to_server_ino(parent_ino), parent_ino_str, sizeof(parent_ino_str));
         encode(name, name_enc);
