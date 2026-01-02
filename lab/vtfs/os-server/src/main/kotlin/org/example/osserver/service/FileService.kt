@@ -40,4 +40,18 @@ class FileService(
     @Transactional
     fun delete(token: String, parentIno: Long, name: String): Boolean =
         repository.deleteByTokenAndParentInoAndName(token, parentIno, name) > 0
+
+    @Transactional
+    fun rmdir(token: String, parentIno: Long, name: String): Long {
+        val rec = repository.findByParentInoAndTokenAndName(parentIno, token, name) ?: return -2
+        if (!rec.isDir) return -2
+
+        val ino = rec.ino ?: return -1
+
+        if (repository.existsByTokenAndParentIno(token, ino)) return -39 // -ENOTEMPTY
+
+        repository.delete(rec)
+        return 0
+    }
+
 }

@@ -109,4 +109,19 @@ class FileController(
         val payload = ResponseJson.ok(success)
         return ResponseBuilder.withRetVal(if (success) 0 else -1, payload)
     }
+
+    @GetMapping("/rmdir")
+    fun rmdir(
+        @RequestParam(name = "token", defaultValue = "") token: String,
+        @RequestParam(name = "parent_ino", defaultValue = "0") parentIno: Long,
+        @RequestParam(name = "name") name: String,
+    ): ResponseEntity<ByteArray> {
+        logger.info("[rmdir] Incoming request token={} parent_ino={} name={}", token, parentIno, name)
+
+        val ret = service.rmdir(token, parentIno, name)
+        val payload = ResponseJson.ok(ret == 0L)
+
+        return ResponseBuilder.withRetVal(ret, payload)
+    }
+
 }

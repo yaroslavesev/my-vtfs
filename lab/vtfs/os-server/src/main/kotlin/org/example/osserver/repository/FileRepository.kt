@@ -18,4 +18,6 @@ interface FileRepository : JpaRepository<FileRecord, Long> {
         @Param("parentIno") parentIno: Long,
         @Param("name") name: String,
     ): Int
+
+    fun existsByTokenAndParentIno(token: String, parentIno: Long): Boolean
 }
