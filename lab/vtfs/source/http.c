@@ -45,7 +45,6 @@ static void dbg_dump_hex_prefix(const char *p, size_t n)
 {
     if (debug_http < 2) return;
 
-    /* печатаем первые ~160 байт в hex, по 16/строка */
     size_t lim = min(n, (size_t)160);
     char line[128];
 
@@ -76,7 +75,8 @@ static int fill_request(struct kvec *vec,
                         size_t arg_size,
                         va_list args)
 {
-    size_t cap = 8192;
+    /* URL может быть большой (data после encode = x3), поэтому делаем большой буфер */
+    size_t cap = 256 * 1024; /* 256KB */
     char *buf = kzalloc(cap, GFP_KERNEL);
     size_t pos = 0;
 
@@ -131,7 +131,6 @@ static int send_all(struct socket *sock, const char *buf, size_t len)
 
 static int receive_all(struct socket *sock, char *buffer, size_t buffer_size)
 {
-    /* buffer_size = реальная ёмкость; мы оставим место под '\0' у вызывающего */
     struct msghdr msg;
     struct kvec vec;
     int total = 0;
@@ -174,9 +173,10 @@ static void dbg_dump_payload_textish(const char *p, size_t n)
 /*
  * HTTP body: [int64 rc][payload...]
  */
-static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_t resp_size)
+static int64_t parse_http_response(char *raw, size_t raw_size,
+                                   char *resp, size_t resp_size,
+                                   size_t *out_payload_len)
 {
-    /* raw гарантированно NUL-terminated вызывающим кодом */
     char *hdr_end = strstr(raw, "\r\n\r\n");
     if (!hdr_end) return -6;
 
@@ -186,31 +186,28 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
     if (sscanf(raw, "HTTP/%*s %d", &code) != 1) return -6;
     if (code != 200) return -5;
 
-        int content_length = -1;
-        {
-            const char *cl = find_hdr(raw, "Content-Length:");
-            if (cl) {
-                const char *p = cl + strlen("Content-Length:");
-                while (*p == ' ') p++;
+    int content_length = -1;
+    {
+        const char *cl = find_hdr(raw, "Content-Length:");
+        if (cl) {
+            const char *p = cl + strlen("Content-Length:");
+            while (*p == ' ') p++;
 
-                /* parse digits only */
-                int v = 0;
-                int any = 0;
-                while (*p >= '0' && *p <= '9') {
-                    any = 1;
-                    v = v * 10 + (*p - '0');
-                    p++;
-                }
-                if (!any) return -6;
-                content_length = v;
+            int v = 0;
+            int any = 0;
+            while (*p >= '0' && *p <= '9') {
+                any = 1;
+                v = v * 10 + (*p - '0');
+                p++;
             }
+            if (!any) return -6;
+            content_length = v;
         }
-
+    }
 
     size_t hdr_size = (size_t)(body - raw);
 
     if (content_length < 0) {
-        /* fallback: всё что после заголовков */
         if (raw_size < hdr_size) return -6;
         content_length = (int)(raw_size - hdr_size);
     }
@@ -221,32 +218,39 @@ static int64_t parse_http_response(char *raw, size_t raw_size, char *resp, size_
     int64_t rc;
     memcpy(&rc, body, sizeof(int64_t));
 
-    int payload_len = content_length - (int)sizeof(int64_t);
-    if (payload_len < 0) payload_len = 0;
+    int payload_len_i = content_length - (int)sizeof(int64_t);
+    if (payload_len_i < 0) payload_len_i = 0;
 
-    if ((size_t)payload_len > resp_size) return -ENOSPC;
+    size_t payload_len = (size_t)payload_len_i;
+    if (out_payload_len) *out_payload_len = payload_len;
+
+    if (payload_len > resp_size) return -ENOSPC;
 
     if (payload_len > 0)
-        memcpy(resp, body + sizeof(int64_t), (size_t)payload_len);
+        memcpy(resp, body + sizeof(int64_t), payload_len);
 
+    /* NUL-терминация для удобства строковых вызовов (json), но payload_len всё равно возвращаем */
     if (resp_size > 0) {
-        size_t n = (size_t)payload_len;
+        size_t n = payload_len;
         if (n >= resp_size) n = resp_size - 1;
         resp[n] = '\0';
     }
 
-    dbg_dump_payload_textish(body + sizeof(int64_t), (size_t)payload_len);
+    dbg_dump_payload_textish(body + sizeof(int64_t), payload_len);
     return rc;
 }
 
-int64_t vtfs_http_call(const char *token, const char *method,
-                       char *response_buffer, size_t buffer_size,
-                       size_t arg_size, ...)
+int64_t vtfs_http_call2(const char *token, const char *method,
+                        char *response_buffer, size_t buffer_size,
+                        size_t *out_payload_len,
+                        size_t arg_size, ...)
 {
     struct socket *sock = NULL;
     struct sockaddr_in saddr;
     int error;
     int64_t ret;
+
+    if (out_payload_len) *out_payload_len = 0;
 
     unsigned long t0 = jiffies;
 
@@ -298,8 +302,7 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -3;
     }
 
-    /* важно: +1 под NUL */
-    size_t cap = buffer_size + 2048 + 1;
+    size_t cap = buffer_size + 4096 + 1; /* +headers +NUL */
     char *raw = kmalloc(cap, GFP_KERNEL);
     if (!raw) {
         kernel_sock_shutdown(sock, SHUT_RDWR);
@@ -307,7 +310,6 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -ENOMEM;
     }
 
-    /* читаем максимум cap-1, чтобы всегда поставить '\0' */
     int read_bytes = receive_all(sock, raw, cap - 1);
 
     kernel_sock_shutdown(sock, SHUT_RDWR);
@@ -319,11 +321,11 @@ int64_t vtfs_http_call(const char *token, const char *method,
         return -4;
     }
 
-    raw[read_bytes] = '\0'; /* КЛЮЧЕВОЙ ФИКС */
+    raw[read_bytes] = '\0';
 
     dbg_dump_hex_prefix(raw, (size_t)read_bytes);
 
-    ret = parse_http_response(raw, (size_t)read_bytes, response_buffer, buffer_size);
+    ret = parse_http_response(raw, (size_t)read_bytes, response_buffer, buffer_size, out_payload_len);
     kfree(raw);
 
     if (ret < 0) {
@@ -331,6 +333,115 @@ int64_t vtfs_http_call(const char *token, const char *method,
     } else {
         http_dbg("ok method=%s rc=%lld time_ms=%u",
                  method, (long long)ret, jiffies_to_msecs(jiffies - t0));
+    }
+
+    return ret;
+}
+
+int64_t vtfs_http_call(const char *token, const char *method,
+                       char *response_buffer, size_t buffer_size,
+                       size_t arg_size, ...)
+{
+    int64_t ret;
+    va_list args;
+    va_start(args, arg_size);
+    /* прокидываем varargs вручную нельзя напрямую, поэтому просто вызываем vtfs_http_call2 через локальную сборку запроса нельзя.
+       Решение: сделаем копию vtfs_http_call как thin-wrapper через vtfs_http_call2 в месте вызова невозможно.
+       Поэтому оставим старый интерфейс как отдельную реализацию: */
+    va_end(args);
+
+    /* Реализация старого интерфейса: просто вызвать vtfs_http_call2 через повторный va_start */
+    {
+        va_list args2;
+        va_start(args2, arg_size);
+
+        /* соберём запрос так же, как в vtfs_http_call2 */
+        struct socket *sock = NULL;
+        struct sockaddr_in saddr;
+        int error;
+
+        unsigned long t0 = jiffies;
+
+        error = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+        if (error < 0) {
+            http_err("sock_create_kern failed=%d", error);
+            va_end(args2);
+            return -1;
+        }
+
+        if (sock && sock->sk) {
+            sock->sk->sk_rcvtimeo = msecs_to_jiffies(2000);
+            sock->sk->sk_sndtimeo = msecs_to_jiffies(2000);
+        }
+
+        memset(&saddr, 0, sizeof(saddr));
+        saddr.sin_family = AF_INET;
+        saddr.sin_port   = htons((u16)server_port);
+        saddr.sin_addr.s_addr = in_aton(server_ip);
+
+        error = kernel_connect(sock, (struct sockaddr *)&saddr, sizeof(saddr), 0);
+        if (error < 0) {
+            http_warn("connect %s:%d failed=%d", server_ip, server_port, error);
+            sock_release(sock);
+            va_end(args2);
+            return -2;
+        }
+
+        struct kvec vec;
+        error = fill_request(&vec, token, method, arg_size, args2);
+        va_end(args2);
+
+        if (error) {
+            http_err("fill_request failed=%d method=%s", error, method);
+            kernel_sock_shutdown(sock, SHUT_RDWR);
+            sock_release(sock);
+            return error;
+        }
+
+        http_dbg("send %s len=%zu", method, vec.iov_len);
+
+        error = send_all(sock, (const char *)vec.iov_base, vec.iov_len);
+        kfree(vec.iov_base);
+
+        if (error < 0) {
+            http_warn("send_all failed=%d method=%s", error, method);
+            kernel_sock_shutdown(sock, SHUT_RDWR);
+            sock_release(sock);
+            return -3;
+        }
+
+        size_t cap = buffer_size + 4096 + 1;
+        char *raw = kmalloc(cap, GFP_KERNEL);
+        if (!raw) {
+            kernel_sock_shutdown(sock, SHUT_RDWR);
+            sock_release(sock);
+            return -ENOMEM;
+        }
+
+        int read_bytes = receive_all(sock, raw, cap - 1);
+
+        kernel_sock_shutdown(sock, SHUT_RDWR);
+        sock_release(sock);
+
+        if (read_bytes < 0) {
+            http_warn("recv failed=%d method=%s", read_bytes, method);
+            kfree(raw);
+            return -4;
+        }
+
+        raw[read_bytes] = '\0';
+
+        dbg_dump_hex_prefix(raw, (size_t)read_bytes);
+
+        ret = parse_http_response(raw, (size_t)read_bytes, response_buffer, buffer_size, NULL);
+        kfree(raw);
+
+        if (ret < 0) {
+            http_warn("parse resp rc=%lld method=%s bytes=%d", (long long)ret, method, read_bytes);
+        } else {
+            http_dbg("ok method=%s rc=%lld time_ms=%u",
+                     method, (long long)ret, jiffies_to_msecs(jiffies - t0));
+        }
     }
 
     return ret;

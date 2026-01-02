@@ -135,9 +135,9 @@ static void ino_to_str(ino_t ino, char *buf, size_t n)
     snprintf(buf, n, "%llu", (unsigned long long)ino);
 }
 
-/* LOCAL ino -> SERVER ino mapping (minimum viable):
+/* LOCAL ino -> SERVER ino mapping:
  * - our VFS root is 100, server root is 0
- * - everything else: send as-is
+ * - everything else: same
  */
 static ino_t vtfs_to_server_ino(ino_t local_ino)
 {
@@ -155,11 +155,26 @@ static void vtfs_dump_files_locked(void)
     vtfs_info("live nodes=%d next_ino=%d unmounting=%d", cnt, next_ino, atomic_read(&vtfs_unmounting));
 }
 
+/* parse {"ok":true,"ino":123} */
+static bool vtfs_parse_created_ino(const char *json, ino_t *out_ino)
+{
+    const char *p = strstr(json, "\"ino\":");
+    if (!p) return false;
+    p += strlen("\"ino\":");
+    {
+        unsigned long long v = 0;
+        if (sscanf(p, "%llu", &v) != 1) return false;
+        *out_ino = (ino_t)v;
+        return true;
+    }
+}
+
 /* super-simple JSON list parser:
  * payload: [{"ino":13,"name":"abc","is_dir":true}, ...]
+ * adds children under given LOCAL parent_ino.
  * returns number of parsed entries (best-effort).
  */
-static int vtfs_parse_list_and_add_root_children(const char *json)
+static int vtfs_parse_list_and_add_children(const char *json, ino_t parent_local_ino)
 {
     const char *p = json;
     int added = 0;
@@ -169,74 +184,68 @@ static int vtfs_parse_list_and_add_root_children(const char *json)
         if (!ino_k) break;
         ino_k += strlen("\"ino\":");
 
-        /* parse ino number */
+        unsigned long long v = 0;
+        int consumed = 0;
+        if (sscanf(ino_k, "%llu%n", &v, &consumed) != 1) break;
+        p = ino_k + consumed;
+
+        const char *name_k = strstr(p, "\"name\":\"");
+        if (!name_k) break;
+        name_k += strlen("\"name\":\"");
+        const char *name_end = strchr(name_k, '"');
+        if (!name_end) break;
+
+        char name[256];
+        size_t nlen = (size_t)(name_end - name_k);
+        if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+        memcpy(name, name_k, nlen);
+        name[nlen] = '\0';
+
+        const char *dir_k = strstr(name_end, "\"is_dir\":");
+        if (!dir_k) break;
+        dir_k += strlen("\"is_dir\":");
+
+        bool is_dir = false;
+        if (!strncmp(dir_k, "true", 4)) is_dir = true;
+        else if (!strncmp(dir_k, "false", 5)) is_dir = false;
+        else break;
+
+        /* skip duplicates */
+        mutex_lock(&vtfs_files_lock);
         {
-            unsigned long long v = 0;
-            int consumed = 0;
-            if (sscanf(ino_k, "%llu%n", &v, &consumed) != 1) break;
-            p = ino_k + consumed;
-
-            /* find name */
-            const char *name_k = strstr(p, "\"name\":\"");
-            if (!name_k) break;
-            name_k += strlen("\"name\":\"");
-            const char *name_end = strchr(name_k, '"');
-            if (!name_end) break;
-
-            /* copy name */
-            char name[256];
-            size_t nlen = (size_t)(name_end - name_k);
-            if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
-            memcpy(name, name_k, nlen);
-            name[nlen] = '\0';
-
-            /* find is_dir */
-            const char *dir_k = strstr(name_end, "\"is_dir\":");
-            if (!dir_k) break;
-            dir_k += strlen("\"is_dir\":");
-
-            bool is_dir = false;
-            if (!strncmp(dir_k, "true", 4)) is_dir = true;
-            else if (!strncmp(dir_k, "false", 5)) is_dir = false;
-            else break;
-
-            /* add node under LOCAL root */
-            mutex_lock(&vtfs_files_lock);
-            {
-                struct vtfs_file_info *exists = NULL;
-                list_for_each_entry(exists, &vtfs_files, list) {
-                    if (exists->deleted) continue;
-                    if (exists->parent_ino == VTFS_ROOT_INO && strcmp(exists->name, name) == 0) {
-                        mutex_unlock(&vtfs_files_lock);
-                        goto next_item;
-                    }
+            struct vtfs_file_info *exists;
+            list_for_each_entry(exists, &vtfs_files, list) {
+                if (exists->deleted) continue;
+                if (exists->parent_ino == parent_local_ino && strcmp(exists->name, name) == 0) {
+                    mutex_unlock(&vtfs_files_lock);
+                    goto next_item;
                 }
             }
+        }
+        mutex_unlock(&vtfs_files_lock);
+
+        /* add */
+        {
+            struct vtfs_file_info *fi = kzalloc(sizeof(*fi), GFP_KERNEL);
+            if (!fi) break;
+
+            mutex_init(&fi->lock);
+            fi->is_dir = is_dir;
+            fi->deleted = false;
+            fi->parent_ino = parent_local_ino;
+            fi->ino = (ino_t)v; /* server ino == local ino after fixes */
+            fi->mode = (is_dir ? (S_IFDIR | 0777) : (S_IFREG | 0777));
+            strscpy(fi->name, name, sizeof(fi->name));
+
+            mutex_lock(&vtfs_files_lock);
+            list_add(&fi->list, &vtfs_files);
+            if ((int)fi->ino >= next_ino) next_ino = (int)fi->ino + 1;
             mutex_unlock(&vtfs_files_lock);
 
-            {
-                struct vtfs_file_info *fi = kzalloc(sizeof(*fi), GFP_KERNEL);
-                if (!fi) break;
-
-                mutex_init(&fi->lock);
-                fi->is_dir = is_dir;
-                fi->deleted = false;
-                fi->parent_ino = VTFS_ROOT_INO; /* local root */
-                fi->ino = (ino_t)v;             /* use server ino as local ino (works for your current server inodes) */
-                fi->mode = (is_dir ? (S_IFDIR | 0777) : (S_IFREG | 0777));
-                strscpy(fi->name, name, sizeof(fi->name));
-
-                mutex_lock(&vtfs_files_lock);
-                list_add(&fi->list, &vtfs_files);
-                if ((int)fi->ino >= next_ino) next_ino = (int)fi->ino + 1;
-                mutex_unlock(&vtfs_files_lock);
-
-                added++;
-            }
+            added++;
         }
 
 next_item:
-        /* move forward to avoid infinite loop */
         {
             const char *brace = strchr(p, '}');
             if (!brace) break;
@@ -247,44 +256,110 @@ next_item:
     return added;
 }
 
-static void vtfs_sync_from_server_root(void)
+static int vtfs_sync_from_server_dir(ino_t parent_local_ino)
 {
-    /* list is small; still allocate a decent buffer */
     const size_t resp_sz = 64 * 1024;
     char *resp = kmalloc(resp_sz, GFP_KERNEL);
     if (!resp) {
         vtfs_warn("sync: no mem for response");
-        return;
+        return -ENOMEM;
     }
     memset(resp, 0, resp_sz);
 
     if (atomic_read(&vtfs_unmounting)) {
         kfree(resp);
-        return;
+        return 0;
     }
 
-    /* server list(root) has no args (per your probes) */
-    (void)vtfs_http_call(token, "list", resp, resp_sz, 0);
+    char parent_ino_str[32];
+    ino_to_str(vtfs_to_server_ino(parent_local_ino), parent_ino_str, sizeof(parent_ino_str));
 
-    /* http.c copies raw bytes; ensure 0-termination for strstr/strncmp usage */
+    (void)vtfs_http_call(token, "list", resp, resp_sz,
+                         1, "parent_ino", parent_ino_str);
+
     resp[resp_sz - 1] = '\0';
 
     if (debug >= 2) {
-        /* may be long; print first chunk only */
         char tmp[201];
         size_t n = strnlen(resp, 200);
         memcpy(tmp, resp, n);
         tmp[n] = '\0';
-        vtfs_dbg("sync: list payload (first 200)='%s'", tmp);
+        vtfs_dbg("sync: list(parent=%lu) payload(first 200)='%s'", parent_local_ino, tmp);
     }
 
     {
-        int added = vtfs_parse_list_and_add_root_children(resp);
-        vtfs_info("sync from server(root=%d): added=%d next_ino=%d",
-                  VTFS_SERVER_ROOT_INO, added, next_ino);
+        int added = vtfs_parse_list_and_add_children(resp, parent_local_ino);
+        vtfs_dbg("sync from server(parent_local=%lu): added=%d", parent_local_ino, added);
     }
 
     kfree(resp);
+    return 0;
+}
+
+/* fetch file bytes from server and cache into fi->content */
+static int vtfs_fetch_file_from_server(struct vtfs_file_info *fi)
+{
+    if (!fi || fi->is_dir) return -EINVAL;
+    if (atomic_read(&vtfs_unmounting)) return -EAGAIN;
+
+    char parent_ino_str[32];
+    char name_enc[3 * 256 + 1];
+
+    ino_to_str(vtfs_to_server_ino(fi->parent_ino), parent_ino_str, sizeof(parent_ino_str));
+    encode(fi->name, name_enc);
+
+    size_t cap = 4096;
+    for (int tries = 0; tries < 6; tries++) {
+        char *resp = kmalloc(cap, GFP_KERNEL);
+        if (!resp) return -ENOMEM;
+        memset(resp, 0, cap);
+
+        size_t payload_len = 0;
+        int64_t rc = vtfs_http_call2(token, "read",
+                                     resp, cap,
+                                     &payload_len,
+                                     2, "parent_ino", parent_ino_str, "name", name_enc);
+
+        if (rc == 0 && payload_len <= cap) {
+            mutex_lock(&fi->lock);
+
+            if (payload_len > fi->content.allocated) {
+                char *new_data = krealloc(fi->content.data, payload_len ? payload_len : 1, GFP_KERNEL);
+                if (!new_data && payload_len > 0) {
+                    mutex_unlock(&fi->lock);
+                    kfree(resp);
+                    return -ENOMEM;
+                }
+                fi->content.data = new_data;
+                fi->content.allocated = payload_len ? payload_len : 1;
+            }
+
+            if (payload_len > 0 && fi->content.data) {
+                memcpy(fi->content.data, resp, payload_len);
+            }
+            fi->content.size = payload_len;
+
+            mutex_unlock(&fi->lock);
+            kfree(resp);
+            return 0;
+        }
+
+        kfree(resp);
+
+        if (rc < 0) {
+            vtfs_warn("fetch read failed rc=%lld name=%s", (long long)rc, fi->name);
+            return -EIO;
+        }
+
+        /* rc==0 but -ENOSPC at parse level => payload bigger than cap */
+        cap *= 2;
+        if (cap > (256 * 1024)) {
+            vtfs_warn("fetch read too big (cap limit) name=%s", fi->name);
+            return -EFBIG;
+        }
+    }
+
+    return -EIO;
 }
 
 /* ---- inode ---- */
@@ -366,12 +441,17 @@ static struct dentry *vtfs_lookup(struct inode *parent_inode, struct dentry *chi
 {
     struct vtfs_file_info *fi = find_file_in_dir(child_dentry->d_name.name, parent_inode->i_ino);
 
+    if (!fi && !atomic_read(&vtfs_unmounting)) {
+        /* lazy sync this directory and retry */
+        (void)vtfs_sync_from_server_dir(parent_inode->i_ino);
+        fi = find_file_in_dir(child_dentry->d_name.name, parent_inode->i_ino);
+    }
+
     if (!fi) {
         d_add(child_dentry, NULL);
         return NULL;
     }
 
-    /* reuse cached inode if possible */
     if (fi->inode) {
         struct inode *inode = igrab(fi->inode);
         if (inode) {
@@ -402,6 +482,11 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
 {
     struct inode *inode = file_inode(filp);
     ino_t current_ino = inode->i_ino;
+
+    /* before listing, sync directory from server (best effort) */
+    if (ctx->pos == 0 && !atomic_read(&vtfs_unmounting)) {
+        (void)vtfs_sync_from_server_dir(current_ino);
+    }
 
     if (ctx->pos == 0) {
         if (!dir_emit(ctx, ".", 1, current_ino, DT_DIR)) return 0;
@@ -462,6 +547,15 @@ static ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t length, 
     struct vtfs_file_info *fi = filp->private_data ? filp->private_data : find_file_info(inode->i_ino);
     if (!fi) return -ENOENT;
 
+    /* lazy fetch from server if cache empty (important after remount) */
+    mutex_lock(&fi->lock);
+    bool need_fetch = (!fi->is_dir && (fi->content.size == 0) && (*offset == 0));
+    mutex_unlock(&fi->lock);
+
+    if (need_fetch && !atomic_read(&vtfs_unmounting)) {
+        (void)vtfs_fetch_file_from_server(fi);
+    }
+
     mutex_lock(&fi->lock);
 
     if (*offset >= fi->content.size) {
@@ -478,20 +572,6 @@ static ssize_t vtfs_read(struct file *filp, char __user *buffer, size_t length, 
 
     *offset += (loff_t)length;
     mutex_unlock(&fi->lock);
-
-    if (!atomic_read(&vtfs_unmounting)) {
-        char response[256] = {0};
-        char parent_ino_str[32];
-        char name_enc[3 * 256 + 1];
-
-        ino_to_str(vtfs_to_server_ino(fi->parent_ino), parent_ino_str, sizeof(parent_ino_str));
-        encode(fi->name, name_enc);
-
-        (void)vtfs_http_call(token, "read", response, sizeof(response),
-                             2, "parent_ino", parent_ino_str, "name", name_enc);
-    } else {
-        vtfs_dbg("skip http read (unmounting) ino=%lu", inode->i_ino);
-    }
 
     return (ssize_t)length;
 }
@@ -552,10 +632,16 @@ static ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t l
 
     inode_set_mtime_to_ts(inode, current_time(inode));
 
+    /* send WHOLE content (server overwrites) */
     size_t send_len = fi->content.size;
-    if (send_len > 1024) send_len = 1024;
 
-    char response[256] = {0};
+    /* URL encoding делает x3, плюс заголовки/параметры. Ограничим разумно. */
+    if (send_len > 60 * 1024) {
+        mutex_unlock(&fi->lock);
+        kfree(tmp);
+        return -E2BIG;
+    }
+
     char parent_ino_str[32];
     char name_enc[3 * 256 + 1];
 
@@ -570,6 +656,7 @@ static ssize_t vtfs_write(struct file *filp, const char __user *buffer, size_t l
     mutex_unlock(&fi->lock);
 
     if (!atomic_read(&vtfs_unmounting) && data_enc) {
+        char response[256] = {0};
         (void)vtfs_http_call(token, "write", response, sizeof(response),
                              3, "parent_ino", parent_ino_str, "name", name_enc, "data", data_enc);
     } else {
@@ -589,8 +676,31 @@ static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode, stru
     const char *name = child_dentry->d_name.name;
     ino_t parent_ino = parent_inode->i_ino;
 
+    /* local fast check */
     if (find_file_in_dir(name, parent_ino)) return -EEXIST;
 
+    if (atomic_read(&vtfs_unmounting)) return -EAGAIN;
+
+    /* 1) create on server first to get ino */
+    char response[4096] = {0};
+    char parent_ino_str[32];
+    char name_enc[3 * 256 + 1];
+
+    ino_to_str(vtfs_to_server_ino(parent_ino), parent_ino_str, sizeof(parent_ino_str));
+    encode(name, name_enc);
+
+    int64_t rc = vtfs_http_call(token, "create", response, sizeof(response),
+                                3, "parent_ino", parent_ino_str, "name", name_enc, "data", "");
+    if (rc == -1) return -EEXIST;
+    if (rc != 0) return -EIO;
+
+    ino_t server_ino = 0;
+    if (!vtfs_parse_created_ino(response, &server_ino) || server_ino == 0) {
+        vtfs_warn("create: cannot parse ino from server response: %s", response);
+        return -EIO;
+    }
+
+    /* 2) create local node with SAME ino */
     struct vtfs_file_info *fi = kzalloc(sizeof(*fi), GFP_KERNEL);
     if (!fi) return -ENOMEM;
 
@@ -600,10 +710,11 @@ static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode, stru
     fi->parent_ino = parent_ino;
     fi->mode = S_IFREG | 0777;
     strscpy(fi->name, name, sizeof(fi->name));
+    fi->ino = server_ino;
 
     mutex_lock(&vtfs_files_lock);
-    fi->ino = next_ino++;
     list_add(&fi->list, &vtfs_files);
+    if ((int)fi->ino >= next_ino) next_ino = (int)fi->ino + 1;
     mutex_unlock(&vtfs_files_lock);
 
     struct inode *inode = vtfs_get_inode(parent_inode->i_sb, fi->mode, fi->ino, fi);
@@ -620,18 +731,6 @@ static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode, stru
     mutex_unlock(&vtfs_files_lock);
 
     d_add(child_dentry, inode);
-
-    if (!atomic_read(&vtfs_unmounting)) {
-        char response[256] = {0};
-        char parent_ino_str[32];
-        char name_enc[3 * 256 + 1];
-
-        ino_to_str(vtfs_to_server_ino(parent_ino), parent_ino_str, sizeof(parent_ino_str));
-        encode(name, name_enc);
-
-        (void)vtfs_http_call(token, "create", response, sizeof(response),
-                             3, "parent_ino", parent_ino_str, "name", name_enc, "data", "");
-    }
 
     vtfs_dbg("create name=%s parent=%lu ino=%lu", name, parent_ino, inode->i_ino);
     return 0;
@@ -683,11 +782,26 @@ static int vtfs_mkdir(struct mnt_idmap *idmap, struct inode *parent_inode, struc
     ino_t parent_ino = parent_inode->i_ino;
 
     if (find_file_in_dir(name, parent_ino)) return -EEXIST;
+    if (atomic_read(&vtfs_unmounting)) return -EAGAIN;
 
-    int new_ino;
-    mutex_lock(&vtfs_files_lock);
-    new_ino = next_ino++;
-    mutex_unlock(&vtfs_files_lock);
+    /* 1) mkdir on server first to get ino */
+    char response[4096] = {0};
+    char parent_ino_str[32];
+    char name_enc[3 * 256 + 1];
+
+    ino_to_str(vtfs_to_server_ino(parent_ino), parent_ino_str, sizeof(parent_ino_str));
+    encode(name, name_enc);
+
+    int64_t rc = vtfs_http_call(token, "mkdir", response, sizeof(response),
+                                2, "parent_ino", parent_ino_str, "name", name_enc);
+    if (rc == -1) return -EEXIST;
+    if (rc != 0) return -EIO;
+
+    ino_t server_ino = 0;
+    if (!vtfs_parse_created_ino(response, &server_ino) || server_ino == 0) {
+        vtfs_warn("mkdir: cannot parse ino from server response: %s", response);
+        return -EIO;
+    }
 
     struct vtfs_file_info *fi = kzalloc(sizeof(*fi), GFP_KERNEL);
     if (!fi) return -ENOMEM;
@@ -696,7 +810,7 @@ static int vtfs_mkdir(struct mnt_idmap *idmap, struct inode *parent_inode, struc
     fi->is_dir = true;
     fi->deleted = false;
     fi->parent_ino = parent_ino;
-    fi->ino = (ino_t)new_ino;
+    fi->ino = server_ino;
     fi->mode = S_IFDIR | 0777;
     strscpy(fi->name, name, sizeof(fi->name));
 
@@ -711,21 +825,10 @@ static int vtfs_mkdir(struct mnt_idmap *idmap, struct inode *parent_inode, struc
     mutex_lock(&vtfs_files_lock);
     fi->inode = inode;
     list_add(&fi->list, &vtfs_files);
+    if ((int)fi->ino >= next_ino) next_ino = (int)fi->ino + 1;
     mutex_unlock(&vtfs_files_lock);
 
     d_add(child_dentry, inode);
-
-    if (!atomic_read(&vtfs_unmounting)) {
-        char response[256] = {0};
-        char parent_ino_str[32];
-        char name_enc[3 * 256 + 1];
-
-        ino_to_str(vtfs_to_server_ino(parent_ino), parent_ino_str, sizeof(parent_ino_str));
-        encode(name, name_enc);
-
-        (void)vtfs_http_call(token, "mkdir", response, sizeof(response),
-                             2, "parent_ino", parent_ino_str, "name", name_enc);
-    }
 
     vtfs_dbg("mkdir name=%s parent=%lu ino=%lu", name, parent_ino, inode->i_ino);
     return 0;
@@ -821,9 +924,8 @@ static int vtfs_fill_super(struct super_block *sb, void *data, int silent)
     if (!sb->s_root) return -ENOMEM;
 
     /* pull server root listing into local cache */
-    vtfs_sync_from_server_root();
+    (void)vtfs_sync_from_server_dir(VTFS_ROOT_INO);
 
-    /* show counts */
     mutex_lock(&vtfs_files_lock);
     vtfs_dump_files_locked();
     mutex_unlock(&vtfs_files_lock);

@@ -5,7 +5,6 @@ import org.example.osserver.service.FileService
 import org.slf4j.LoggerFactory
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
-import org.springframework.web.bind.annotation.RequestHeader
 import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.RestController
@@ -63,8 +62,9 @@ class FileController(
             return ResponseBuilder.withRetVal(-1, payload)
         }
 
-        service.create(token, parentIno, false, content, name)
-        val payload = ResponseJson.ok(true)
+        val created = service.create(token, parentIno, false, content, name)
+        val ino = created.ino ?: 0L
+        val payload = ResponseJson.created(ino)
         return ResponseBuilder.withRetVal(0, payload)
     }
 
@@ -94,8 +94,9 @@ class FileController(
         if (existing != null) {
             return ResponseBuilder.withRetVal(-1, ResponseJson.ok(false))
         }
-        service.create(token, parentIno, true, null, name)
-        return ResponseBuilder.withRetVal(0, ResponseJson.ok(true))
+        val created = service.create(token, parentIno, true, null, name)
+        val ino = created.ino ?: 0L
+        return ResponseBuilder.withRetVal(0, ResponseJson.created(ino))
     }
 
     @GetMapping("/unlink")
@@ -123,5 +124,4 @@ class FileController(
 
         return ResponseBuilder.withRetVal(ret, payload)
     }
-
 }

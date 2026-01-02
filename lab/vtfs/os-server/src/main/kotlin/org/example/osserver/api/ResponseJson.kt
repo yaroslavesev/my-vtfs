@@ -9,6 +9,9 @@ object ResponseJson {
     fun ok(value: Boolean): ByteArray =
         mapper.writeValueAsBytes(mapOf("ok" to value))
 
+    fun created(ino: Long): ByteArray =
+        mapper.writeValueAsBytes(mapOf("ok" to true, "ino" to ino))
+
     fun builder(value: Any): ByteArray =
         mapper.writeValueAsBytes(value)
 }
